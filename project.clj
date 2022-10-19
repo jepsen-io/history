@@ -16,4 +16,11 @@
   :repl-options {:init-ns jepsen.history}
   :profiles {:dev {:dependencies
                    [[org.clojure/clojure "1.10.3"]
-                    [org.clojure/test.check "1.1.1"]]}})
+                    [org.clojure/test.check "1.1.1"]
+                    [org.slf4j/slf4j-simple "2.0.3"]
+                    ]}}
+  :test-selectors {:default (fn [m]
+                              (not (or (:perf m)
+                                       (:integration m))))
+                   :focus       :focus
+                   :perf        :perf})

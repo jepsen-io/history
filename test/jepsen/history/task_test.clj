@@ -1,7 +1,18 @@
 (ns jepsen.history.task-test
   (:require [clojure [pprint :refer [pprint]]
                      [test :refer :all]]
+                        [clojure.test.check [clojure-test :refer :all]
+                                [generators :as gen]
+                                [properties :as prop]
+                                [results :refer [Result]]
+                                [rose-tree :as rose]]
+            [clojure.tools.logging :refer [info warn]]
+            [dom-top.core :refer [loopr]]
             [jepsen.history.task :as t]))
+
+(def trials
+  "How aggressive should we be?"
+  100)
 
 (deftest basic-test
   (let [e     (t/executor)
@@ -55,7 +66,8 @@
         log! (fn [name promise] (fn [inputs]
                                   (swap! log conj [:start name])
                                   @promise
-                                  (swap! log conj [:end name])))
+                                  (swap! log conj [:end name])
+                                  name))
         ; Submit a task
         ap (promise)
         a (t/submit! e :a nil (log! :a ap))
@@ -69,26 +81,84 @@
         ; things still work
         dp (promise)
         d (t/submit! e :d [] (log! :d dp))
-        ; Cancel a. This should also cancel b and c should be
-        ; descheduled.
+        ; Cancel a. This should also cancel b and c.
         state1 (t/txn! e (fn [state]
                            (t/cancel-task state a)))
-        _ (is (= [[:cancel-task a] [:cancel-task b] [:cancel-task c]]
-                 (:effects state1)))
         ; Allow a to continue
         _ (deliver ap true)
         ; A should have blown up during execution
-        _ (is (thrown? InterruptedException @a))
+        ;_ (is (thrown? InterruptedException @a))
+        ; Changed my mind: we can't interrupt tasks safely or it'll break
+        ; mutable reducers. A should complete.
+        _ (is (= :a @a))
         ; Even if we let b and c run, b and c should not have executed at all,
-        ; but a should have started. D runs to completion, since it had no
-        ; deps. Not sure how to do this without a sleep; unfortunately this is
-        ; fragile.
+        ; but a should have started. and completed. D also runs to completion,
+        ; since it had no deps. Not sure how to do this without a sleep;
+        ; unfortunately this is fragile.
         _ (deliver bp true)
         _ (deliver cp true)
         _ (deliver dp true)
         _ (Thread/sleep 10)
         _ (is (= [[:start :a]
                   [:start :d]
+                  [:end :a]
                   [:end :d]]
                  @log))
         ]))
+
+(deftest concurrent-test
+  ; Every task should execute exactly once, and in dependency order.
+  (let [n     1000
+        log   (atom [])
+        e     (t/executor)
+        tasks (loop [i 0
+                     tasks (transient [])]
+                (if (= i n)
+                  (persistent! tasks)
+                  ; Pick some random deps
+                  (let [dep-count (rand-int (min 5 (count tasks)))
+                        deps (loop [i    0
+                                    deps (transient [])]
+                               (if (= i dep-count)
+                                 (persistent! deps)
+                                 ; Pick recent tasks to make it interesting
+                                 (let [dep-index (-> (count tasks)
+                                                     (- 1 (rand-int 10))
+                                                     (max 0))]
+                                   (recur (inc i)
+                                          (conj! deps (nth tasks dep-index))))))
+                        task (t/submit! e
+                                        i
+                                        deps
+                                        (fn go [inputs]
+                                          (swap! log conj [i inputs])
+                                          i))]
+                        (recur (inc i) (conj! tasks task)))))
+        ; Await all tasks
+        _ (mapv deref tasks)
+        log @log]
+    ;(pprint log)
+    ; Check tasks
+    (is (= n (count tasks)))
+    (loopr [i 0]
+           [task tasks]
+           ; Task names should be 0, 1, ...
+           (do (is (= i (t/name task)))
+               ; Value should also be i
+               (is (= i @task))))
+    ; Check log
+    (is (= n (count log)))
+    (loopr [seen? (transient #{})]
+           [[i input] log]
+           ; We don't want to see a task more than once
+           (do (is (not (seen? i)))
+               ; Should have seen right inputs
+               (let [task           (nth tasks i)
+                     deps           (.deps task)
+                     expected-input (reduce (fn [ei dep]
+                                              (assoc ei
+                                                     (t/id dep)
+                                                     (t/name dep)))
+                                            {}
+                                            deps)]
+                 (is (= expected-input input)))))))

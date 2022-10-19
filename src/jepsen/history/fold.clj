@@ -146,6 +146,143 @@
                                IGraph
                                Graph)))
 
+; We want to run multiple folds concurrently. This FusedFold datatype allows
+; that, and can be extended with new folds later. It returns a vector of
+; results for each individual fold it contains.
+(defrecord FusedFold
+  [; These fields let us work transparently like any other fold map
+   reducer-identity
+   reducer
+   post-reducer
+   combiner-identity
+   combiner
+   post-combiner
+   associative?
+   ; But we also track a vector of the original folds we're now fusing.
+   folds])
+
+(defn fused?
+  "Is this fold a fused fold?"
+  [fold]
+  (instance? FusedFold fold))
+
+(defn fuse
+  "Takes a fold (possibly a FusedFold) and fuses a new fold into it. Also
+  provides a means of joining in-process reducer/combiner state together, so
+  that you can zip together two independent folds and continue with the fused
+  fold halfway through. Returns a map of:
+
+    :fused              A new FusedFold which performs everything the original
+                        fold did *plus* the new fold.
+
+    :join-accs          A function which joins together accumulators from the
+                        original and new fold. Works on both reduce and combine
+                        accumulators. Returns an accumulator for the new fold.
+
+  If this isn't fast enough, we might try doing some insane reflection and
+  dynamically compiling a new class to hold reducer state with primitive
+  fields."
+  [old-fold new-fold]
+  (let [; If we're fusing into a fused fold, we slot in our fold at the end of
+        ; its existing folds.
+        folds' (if (fused? old-fold)
+                 (conj (:folds old-fold) new-fold)
+                 ; We have no insight here; just make a pair.
+                 [old-fold new-fold])
+        ; The reducer identity constructs an array of reducer identities
+        reducer-identity
+        (fn reducer-identity []
+          (->> folds'
+               (map (fn [fold]
+                      ((:reducer-identity fold))))
+               object-array))
+        ; Reducers update each field in the array. This is a *very* hot path.
+        ; We pre-materialize an array of reducer functions to speed up
+        ; traversal. We clobber reducer array state in-place. This SHOULD, I
+        ; think, be OK because of the memory happens-before effects of the task
+        ; executor's queue.
+        reducers (object-array (map :reducer folds'))
+        n        (alength reducers)
+        reducer (fn reducer [^objects accs x]
+                  (loop [i 0]
+                    (if (< i n)
+                      (let [reducer (aget reducers i)
+                            acc     (aget accs i)
+                            acc'    (reducer acc x)]
+                        (aset accs i acc')
+                        (recur (unchecked-inc-int i)))
+                      ; Done
+                      accs)))
+        ; Post-reducers again update each field in the array. We can clobber it
+        ; in-place.
+        post-reducers (object-array (map :post-reducer folds'))
+        post-reducer  (fn post-reducer [^objects accs]
+                        (loop [i 0]
+                          (if (< i n)
+                            (let [post-reducer (aget post-reducers i)
+                                  acc          (aget accs i)
+                                  acc'         (post-reducer acc)]
+                              (aset accs i acc')
+                              (recur (unchecked-inc-int i)))
+                            ; Done
+                            accs)))
+        ; Combiners: same deal
+        combiner-identity (fn combiner-identity []
+                            (->> folds'
+                                 (map (fn [fold]
+                                        ((:combiner-identity fold))))
+                                 object-array))
+        combiners (object-array (map :combiner folds'))
+        combiner (fn combiner [^objects accs ^objects xs]
+                   (loop [i 0]
+                     (if (< i n)
+                       (let [combiner (aget combiners i)
+                             acc (aget accs i)
+                             x   (aget xs i)
+                             acc' (combiner acc x)]
+                         (aset accs i acc')
+                         (recur (unchecked-inc-int i)))
+                       accs)))
+        post-combiners (object-array (map :post-combiner folds'))
+        ; Turn things back into vectors on the way out
+        post-combiner (fn post-combiner [^objects accs]
+                        (loop [i     0
+                               accs' (transient [])]
+                          (if (< i n)
+                            (let [post-combiner (aget post-combiners i)
+                                  acc (aget accs i)
+                                  acc' (post-combiner acc)]
+                              (recur (unchecked-inc-int i)
+                                     (conj! accs' acc')))
+                            (persistent! accs'))))
+        ; Now we need functions to join together reducer and combiner state.
+        ; The shape here is going to depend on whether the original fold was a
+        ; FusedFold (in which case it has an array of accs) or a normal fold
+        ; (in which case it has a single acc).
+        join-accs (if (fused? old-fold)
+                    ; Old fold has an array; new fold has a single acc.
+                    (fn join-fused [^objects old-accs, new-acc]
+                      (let [old-n (alength old-accs)
+                            accs' (object-array (inc old-n))]
+                        (System/arraycopy old-accs 0 accs' 0 old-n)
+                        (aset accs' old-n new-acc)
+                        accs'))
+                    ; Construct tuples
+                    (fn join-unfused [old-acc new-acc]
+                      (object-array [old-acc new-acc])))
+        fused (map->FusedFold
+                {:reducer-identity  reducer-identity
+                 :reducer           reducer
+                 :post-reducer      post-reducer
+                 :combiner-identity combiner-identity
+                 :combiner          combiner
+                 :post-combiner     post-combiner
+                 :associative?      (and (:associative? old-fold)
+                                         (:associative? new-fold))
+                 :folds             folds'})]
+    {:fused     fused
+     :join-accs join-accs}))
+
 (deftype Executor
   [task-executor
    history])

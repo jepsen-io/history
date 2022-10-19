@@ -6,6 +6,7 @@
                                 [properties :as prop]
                                 [results :refer [Result]]
                                 [rose-tree :as rose]]
+            [clojure.tools.logging :refer [info warn]]
             [jepsen.history [core :as hc]
                             [fold :as f]
                             [task :as t]])
@@ -103,11 +104,36 @@
     (assoc fold-mean-cuteness
            :associative? assoc?)))
 
-(def fold-gen
-  "Makes a random fold over dogs"
+(declare fold-gen)
+
+(defn fold-fuse-gen
+  "Takes two generators of folds, and returns a generator of folds that fuses
+  both together."
+  [old-fold-gen new-fold-gen]
+  (gen/let [old-fold old-fold-gen
+            new-fold new-fold-gen]
+    (assoc (:fused (f/fuse old-fold new-fold))
+           :name [(:name old-fold) (:name new-fold)]
+           :model (fn [dogs]
+                    (let [old-res ((:model old-fold) dogs)
+                          new-res ((:model new-fold) dogs)]
+                      (if (f/fused? old-fold)
+                        ; Fusing into a fused fold yields a flat vector.
+                        (conj old-res new-res)
+                        ; Pair of plain folds
+                        [old-res new-res]))))))
+
+(def basic-fold-gen
+  "Makes a random, basic fold over dogs"
   (gen/one-of
     [fold-count-gen
      fold-mean-cuteness-gen]))
+
+(def fold-gen
+  "Makes a (possibly recursively fused) fold over dogs."
+  (gen/recursive-gen (fn [fold-gen]
+                       (fold-fuse-gen fold-gen fold-gen))
+                     basic-fold-gen))
 
 (defn apply-fold-with-reduce
   "Applies a fold naively using reduce"
@@ -132,6 +158,7 @@
                   (binding [;*out* stdout
                             ;*err* stdout
                             ]
+                    (prn :active (Thread/activeCount))
                     (let [executor   (f/executor (hc/chunked chunk-size dogs))
                           model-res  ((:model fold) dogs)
                           reduce-res (apply-fold-with-reduce fold dogs)

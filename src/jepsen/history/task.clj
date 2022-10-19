@@ -2,6 +2,7 @@
   "Supports jepsen.history.dataflow by providing a low-level executor for tasks
   with dependencies. Handles threadpool management, wraps queue operations,
   etc."
+  (:refer-clojure :exclude [name])
   (:require [clojure [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ loopr]])
@@ -11,22 +12,26 @@
            (io.lacuna.bifurcan DirectedGraph
                                IEdge
                                IGraph
+                               IList
                                IMap
                                ISet
                                Graphs
+                               List
                                Map
                                Set)
            (java.util.concurrent ArrayBlockingQueue
+                                 BlockingQueue
                                  ExecutorService
                                  Executors
                                  Future
                                  LinkedBlockingQueue
                                  ThreadPoolExecutor
                                  TimeUnit)
+           (java.util.concurrent.locks Condition
+                                       ReentrantLock)
            (java.util.function Function)))
 
-(declare finish-task!
-         queue-tasks!)
+(declare finish-task!)
 
 ; Represents low-level tasks. For speed, we hash and compare equality strictly
 ; by ID. Tasks should not be compared across different executors!
@@ -40,10 +45,6 @@
    ; A function which takes a map of task IDs (our dependencies) to their
    ; results, and produces a result
    f
-   ; A promise of a Future for this task's execution. Delivered only when the
-   ; task is queued up on the executor. Wish we could have this earlier so it
-   ; didn't need to be stateful, but no dice.
-   future
    ; The promise we should deliver our own result to.
    ^IDeref output
    ; The executor we should update when we complete
@@ -110,168 +111,315 @@
   [^Task t]
   (.id t))
 
-; An immutable representation of our executor state
+(defn task-deps
+  "Returns the deps of a task."
+  [^Task t]
+  (.deps t))
+
+(defn name
+  "Returns the name of a task."
+  [^Task t]
+  (.name t))
+
+; An immutable representation of our executor state. By happy circumstance, it
+; is *also* an immutable representation of a queue, which the executor can pull
+; work from.
 (defrecord State
-  [; The next task ID we'll hand out
-   ^long next-task-id
-   ; A graph of dependencies between tasks. Iff a -> b, b depends on a's
-   ; results. Once tasks are completed, they're removed from this graph.
+  [^long          next-task-id
    ^DirectedGraph dep-graph
-   ; A set of tasks we've queued for execution. Once tasks are completed,
-   ; they're removed from this set.
-   ^ISet queued-tasks
-   ; A vector of unapplied side effects. Pure functions of the state build up
-   ; this vector, and it's applied and emptied by mutable functions like txn!.
-   effects])
+   ^ISet          ready-tasks
+   ^ISet          running-tasks
+   ^IList         effects])
 
 (defn state
-  "Constructs a new executor state"
+  "Constructs a new executor state. States have five parts:
+
+  - The next task ID we'll hand out
+
+  - A graph of dependencies between tasks. Iff a -> b, b depends on a's
+    results. Once tasks are completed, they're removed from this graph.
+
+  - A set of ready tasks which have no pending dependencies, but have not yet
+    begun. These tasks are eligible to be executed by the threadpool.
+
+  - A set of running tasks we're currently executing. When the executor begins
+    executing a task, it moves from the ready set to the running set.
+
+  - A list of unapplied side effects. Pure functions of the state add effects
+    to the end of this list. They're applied by a mutable function
+    apply-effects!) later, and popped off the list as this occurs."
   []
   (State. 0
           (.forked (DirectedGraph.))
           (.forked (Set.))
-          []))
+          (.forked (Set.))
+          (.forked (List.))))
 
 (defn state-done?
-  "Returns true when a state has nothing queued and nothing in the dependency
-  graph; e.g. there is nothing more for it to do."
+  "Returns true when a state has nothing ready, nothing running, and nothing in
+  the dependency graph; e.g. there is nothing more for it to do."
   [^State state]
   (and (= 0 (.size ^DirectedGraph (.dep-graph state)))
-       (= 0 (.size ^ISet (.queued-tasks state)))))
+       (= 0 (.size ^ISet (.ready-tasks state)))
+       (= 0 (.size ^ISet (.running-tasks state)))))
 
 (defn new-task
   "Given a state, constructs a fresh task with the given name, collection of
   Tasks as dependencies, a function (f dep-results) which takes a map of
   dependency IDs to their results, and an Executor to inform when the task is
-  done. Returns new state with a [:new-task t] effect."
+  done. Returns the state with the new task integrated, including a [:new-task
+  task], which you can use to read the created task.
+
+  If the task has no dependencies, it may be ready immediately; the :new-task
+  effect will be followed by a [:ready-task task] effect. In either case, the
+  final effect *will* contain the newly created task."
   [^State state name deps f executor]
   (let [id         (.next-task-id state)
-        task       (Task. id name deps f (promise) (promise) executor)
+        task       (Task. id name deps f (promise) executor)
         ; Update dependency graph
-        dep-graph  ^DirectedGraph (.dep-graph state)
-        dep-graph' (loopr [^DirectedGraph g (.. dep-graph
-                                                linear
-                                                (add task))]
-                          [dep deps]
-                          (do (assert+
-                                (instance? Task dep)
-                                IllegalArgumentException
-                                (str "Dependencies must be tasks, but got "
-                                     (pr-str deps)))
-                            (recur (.link g dep task)))
-                          (.forked g))]
+        ^DirectedGraph dep-graph (.dep-graph state)
+        ^DirectedGraph dep-graph'
+        (loopr [^DirectedGraph g (.. dep-graph
+                                     linear
+                                     (add task))]
+               [dep deps]
+               (do (assert+
+                     (instance? Task dep)
+                     IllegalArgumentException
+                     (str "Dependencies must be tasks, but got "
+                          (pr-str deps)))
+                   ; We don't want to add things back to the dep
+                   ; graph if they're already finished
+                   (if (.contains (.vertices g) dep)
+                     (recur (.link g dep task))
+                     (recur g)))
+               (.forked g))
+        ; Is the task ready now?
+        ready? (= 0 (.size ^ISet (.in dep-graph' task)))
+        ; If it's ready, we add it to the ready set
+        ready-tasks  ^ISet (.ready-tasks state)
+        ready-tasks' (if ready?
+                       (.add ready-tasks task)
+                       ready-tasks)
+        ; And record effects
+        effects ^IList (.effects state)
+        effects' (.addLast effects [:new-task task])
+        effects' (if ready?
+                   (.addLast effects' [:ready-task task])
+                   effects')]
     ;(info :new-task task)
     (assoc state
-           :next-task-id (inc id)
-           :dep-graph dep-graph'
-           :effects (conj (.effects state) [:new-task task]))))
-
-(defn queue-task
-  "Takes a state and looks for a task that can be executed. If so, adds the
-  task to queued-tasks, and returns the resulting state with with a
-  [:queue-task task] effect. If no tasks can be queued, returns state
-  unchanged."
-  [^State state]
-  ; Traverse the graph looking for a node with no edges in to it which hasn't
-  ; been queued yet.
-  (let [^DirectedGraph dep-graph    (.dep-graph state)
-        ^ISet          queued-tasks (.queued-tasks state)]
-    ; This is... n^2 inefficient but whatever, just a prototype. We'll profile
-    ; and if it's a problem do something smarter, like keeping track of likely
-    ; candidates as the graph changes.
-    (loopr []
-           [^Task t (.vertices dep-graph)]
-           (do ;(info :checking t)
-               (if (and (not (.contains queued-tasks t))
-                        (= 0 (.size (.in dep-graph t))))
-                 ; Found a task with no deps!
-                 (assoc state
-                        :queued-tasks (.add ^ISet (.queued-tasks state) t)
-                        :effects (conj (.effects state) [:queue-task t]))
-                 (recur)))
-           ; Nothing to do
-           state)))
-
-(defn queue-tasks
-  "Takes a state and queues as many tasks as possible."
-  [state]
-  (let [state' (queue-task state)]
-    (if (identical? state state')
-      ; Done!
-      state'
-      (recur state'))))
+           :next-task-id  (inc id)
+           :dep-graph     dep-graph'
+           :ready-tasks   ready-tasks'
+           :effects       effects')))
 
 (defn finish-task
   "Takes a state and a task which has been executed, and marks it as completed.
-  This deletes the state from the queued set and returns the resulting state
-  with a [:finish-task t] effect."
+  This deletes the state from the running set and returns the resulting state.
+  It may also result in new tasks being ready."
   [^State state, ^Task task]
-  (assoc state
-         :queued-tasks (.remove ^ISet (.queued-tasks state) task)
-         :dep-graph    (.remove ^DirectedGraph (.dep-graph state) task)
-         :effects      (conj (.effects state) [:finish-task task])))
+  (let [; Definitely shouldn't be ready
+        ^ISet ready    (.ready-tasks state)
+        _ (assert (not (.contains ready task)))
+        ; Remove from running
+        ^ISet running  (.running-tasks state)
+        running'       (.remove running task)
+        ; Remove from dep graph
+        ^DirectedGraph dep-graph (.dep-graph state)
+        dep-graph'     (.remove dep-graph task)
+        ; Completing this task may make others ready
+        ^IList effects (.effects state)
+        [ready' effects']
+        (if (.contains ^ISet (.vertices dep-graph) task)
+          (loopr [^ISet ready'    (.linear ready)
+                  ^IList effects' (.linear effects)]
+                 [dependent (.out dep-graph task)]
+                 ; If it has no deps and isn't ready or running, we can
+                 ; add it to the ready set and log an effect
+                 (if (and (= 0 (.size (.in dep-graph' dependent)))
+                          (not (.contains running' dependent))
+                          (not (.contains ready' dependent)))
+                   (recur (.add ready' dependent)
+                          (.addLast effects' [:ready-task dependent]))
+                   (recur ready' effects'))
+                 [(.forked ready')
+                  (.forked effects')])
+          ; Already removed from the dep graph; there won't be any deps.
+          [ready effects])]
+    (assoc state
+           :ready-tasks   ready'
+           :running-tasks running'
+           :dep-graph     dep-graph'
+           :effects       effects')))
 
 (defn cancel-task
   "Takes a state and a task to cancel. Deletes the task, and any tasks which
-  depend on it, from the graph and queued tasks set. Adds :cancel-task
-  effects to the state for each task cancelled."
+  depend on it, from every part of the state."
   [^State state, ^Task task]
   (let [^DirectedGraph dep-graph (.dep-graph state)
         ; A Function which finds tasks depending on this one
         dependents (reify Function
                      (apply [_ task]
                        (.out dep-graph task)))]
-    (loopr [dep-graph'    (.linear dep-graph)
-            queued-tasks' (.linear (.queued-tasks state))
-            effects'      (transient (.effects state))]
+    (loopr [^DirectedGraph dep-graph' (.linear dep-graph)
+            ^ISet ready-tasks'        (.linear ^ISet (.ready-tasks state))
+            ^ISet running-tasks'      (.linear ^ISet (.running-tasks state))]
            [t (Graphs/bfsVertices task dependents)]
-           (recur (.remove dep-graph' t)
-                  (.remove queued-tasks' t)
-                  (conj! effects' [:cancel-task t]))
+           (recur (.remove dep-graph'     t)
+                  (.remove ready-tasks'   t)
+                  (.remove running-tasks' t))
            (assoc state
-                  :dep-graph    (.forked dep-graph')
-                  :queued-tasks (.forked queued-tasks')
-                  :effects      (persistent! effects')))))
+                  :dep-graph     (.forked dep-graph')
+                  :ready-tasks   (.forked ready-tasks')
+                  :running-tasks (.forked running-tasks')))))
+
+(defn state-queue-claim-task*!
+  "A support function for StateQueue.run. Definitely don't call this yourself.
+
+  Takes a state and a volatile. Tries to move a task from the ready set to the
+  running set, and if that works, sets the volatile to that task. Otherwise
+  sets the volatile to nil."
+  [^State state, vol]
+  (let [^ISet ready (.ready-tasks state)]
+    (if (= 0 (.size ready))
+      (do (vreset! vol nil)
+          state)
+      (let [task (.nth ready 0)]
+        (when (.contains ^ISet (.running-tasks state) task)
+          (warn "Task" task "is both ready AND running:"
+                (with-out-str (pprint state))))
+        (assert (not (.isLinear ^ISet (.running-tasks state))))
+        (assert (not (.isLinear ^ISet (.ready-tasks state))))
+        (vreset! vol task)
+        (assoc state
+               :ready-tasks   (.remove ready task)
+               :running-tasks (.add ^ISet (.running-tasks state) task))))))
+
+(deftype StateQueue
+  ; We don't actually NEED to lock anything, but it's the only way to get a
+  ; Condition I've found. Maybe we just back off to Object.await?
+  [state, ^ReentrantLock lock, ^Condition not-empty seen?]
+  BlockingQueue
+  (isEmpty [this]
+    (= 0 (.size this)))
+
+  (size [this]
+    (.size ^ISet (.ready-tasks ^State @state)))
+
+  ; Adapted from https://github.com/openjdk/jdk/blob/9583e3657e43cc1c6f2101a64534564db2a9bd84/src/java.base/share/classes/java/util/concurrent/LinkedBlockingQueue.java#L449
+  (poll [this timeout time-unit]
+    (let [task (volatile! nil)]
+      (try (.lock lock)
+           (loop [nanos (.toNanos time-unit timeout)]
+             ; Try moving a task from ready to running
+             (let [^State state' (swap! state state-queue-claim-task*! task)]
+               (if-let [task @task]
+                 (do ; We got a task! Any left?
+                     ; (info :polled task :state (with-out-str (pprint state')))
+                     (when (< 0 (.size ^ISet (.ready-tasks state')))
+                       ; Someone else might be waiting
+                       (.signal not-empty))
+                     (when (@seen? task)
+                       ; Oh no
+                       (warn "Task dequeued twice:" task "\n"
+                             (with-out-str (pprint state'))))
+                     (swap! seen? conj task)
+                     task)
+                 ; No tasks ready. Sleep more?
+                 (if (< 0 nanos)
+                   (recur (.awaitNanos not-empty nanos))
+                   nil))))
+           (finally
+             (.unlock lock)))))
+
+  (take [this]
+    (.poll this Long/MAX_VALUE TimeUnit/NANOSECONDS))
+
+  (offer [this task]
+    ; skskskskksks
+    (try (.lock lock)
+         (.signal not-empty)
+         (finally
+           (.unlock lock)))
+    true))
+
+(defn state-queue
+  "A queue for our ThreadPoolExecutor which wraps an atom of a State. Tasks are
+  pulled off the state's queue and placed into the running set. This lets us
+  get around issues with handing off records from our immutable state (which is
+  basically a queue!) to a standard mutable executor queue (which we can't
+  mutate safely).
+
+  We're doing something *kind of* evil here: to avoid mutating the state
+  twice, we actually:
+
+  1. Put the task into our state directly, using our own transactional fns
+  2. Call executor.execute(task)
+  3. The executor tries to put that task onto this queue; we return true and do
+     nothing because we *know* we already have it.
+  4. The executor threads poll us, and we hand them tasks from the queue."
+  [state-atom]
+  (let [lock (ReentrantLock. false)]
+    (StateQueue. state-atom lock (.newCondition lock) (atom #{}))))
+
 
 (deftype Executor [; The ExecutorService which actually does work
                    ^ExecutorService executor-service
                    ; An atom containing our current state.
-                   ^State state])
+                   state])
 
 (defn executor
   "Constructs a new Executor for tasks. Executors are mutable thread-safe
   objects."
   []
   (let [procs (-> (Runtime/getRuntime) .availableProcessors)
-        ; We use an unbounded queue with a large core pool size, but allow core
-        ; threads to time out--we want this executor to shrink to nothing when
-        ; not in use.
+        state (atom (state))
+        state-queue (state-queue state)
         exec (doto (ThreadPoolExecutor. procs ; core pool
                                         procs ; max pool
                                         1 TimeUnit/SECONDS ; keepalive
-                                        (LinkedBlockingQueue.))
-               (.allowsCoreThreadTimeOut))]
-    (Executor. exec (atom (state)))))
+                                        state-queue)
+               (.allowCoreThreadTimeOut true))]
+    (Executor. exec state)))
 
 (defn executor-state
   "Reads the current state of an Executor."
   [^Executor e]
   @(.state e))
 
+(def void-runnable
+  "A dummy runnable which only exists to wake up a ThreadPoolExecutor."
+  (reify Runnable
+    (run [this])))
+
 (defn apply-effects!
-  "Takes an executor and a state, and applies that state's side effects.
-  Returns state."
-  [^Executor executor, ^State state]
-  (doseq [[type ^Task task] (.effects state)]
-    (case type
-      :new-task    nil
-      :queue-task  (let [^ExecutorService exec (.executor-service executor)
-                         fut (.submit exec task)]
-                     (deliver (.future task) fut))
-      :finish-task nil
-      :cancel-task (when (realized? (.future task))
-                     (.cancel ^Future @(.future task) true))
-  state)))
+  "Attempts to apply all pending effects from an Executor's state. Side effects
+  may be interleaved in any order. When an effect is applied it is removed from
+  the effect queue. Returns executor.
+
+  In the two-arity form, performs a specific effect."
+  ([^Executor executor]
+   (let [; Claim effects to execute
+         effects (volatile! nil)
+         state'  (swap! (.state executor)
+                        (fn claim-effects [^State state]
+                          (vreset! effects (.effects state))
+                          (assoc state :effects (List.))))]
+     (doseq [effect @effects]
+      (apply-effects! executor effect))))
+  ; Actually *do* a single side effect
+  ([^Executor executor, [type, ^Task task]]
+   ;(info :effect type task)
+   (case type
+     ; Nothing to do for a new task--it's just an effect so callers can read
+     ; off their created tasks.
+     :new-task   nil
+     :ready-task (let [^ExecutorService exec (.executor-service executor)]
+                   ; The *only* purpose of this is to wake up the executor
+                   ; service in case it's asleep. The work is already in the
+                   ; state atom, and therefore the state queue.
+                   (.execute exec void-runnable)))))
 
 (defn txn!
   "Executes a transaction on an executor. Takes an executor and a function
@@ -285,20 +433,21 @@
   this function's return value: it's as if they took place 'automatically' just
   after the transaction finished."
   [^Executor executor, f]
-  (let [caller-state (atom nil)
-        final-state  (atom nil)]
+  (let [caller-state (atom nil)]
     (swap! (.state executor)
            (fn txn [state]
              (let [state' (f state)]
                ; Save the state the caller returned
                (reset! caller-state state')
-               ; Now we may have tasks to queue as a result of their actions
-               (let [state' (queue-tasks state')]
-                 (reset! final-state state')
-                 ; Now we're going to apply these effects, so we clear the
-                 ; effects list.
-                 (assoc state' :effects [])))))
-    (apply-effects! executor @final-state)
+               ; Now we may have tasks that are ready as a result of their
+               ; actions
+               ; -> Nope, changed my mind: all transition functions maintain
+               ; :ready-tasks themselves
+               ;(ready-tasks state'))
+               state')))
+    ;(info :txn! (with-out-str (pprint @caller-state)))
+    ; Apply side effects
+    (apply-effects! executor)
     ; Return caller's generated state
     @caller-state))
 
@@ -307,12 +456,6 @@
   [executor task]
   (txn! executor #(finish-task % task)))
 
-(defn queue-tasks!
-  "Steps an Executor forward by queuing up as many tasks as possible. Returns
-  executor."
-  [executor]
-  (txn! queue-tasks))
-
 (defn submit!
   "Submits a new task to an Executor. Takes a task name, a collection of Tasks
   as dependencies, and a function `(f dep-results)` which receives a map of
@@ -320,7 +463,5 @@
   [executor name deps f]
   (let [; Create the task
         ^State state' (txn! executor #(new-task % name deps f executor))
-        ;_ (prn :submit! :state)
-        ;_ (pprint state')
-        [_ task] (peek (.effects state'))]
+        [_ task] (.last ^IList (.effects state'))]
     task))
