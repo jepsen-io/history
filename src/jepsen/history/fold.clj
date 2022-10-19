@@ -297,7 +297,6 @@
      :combines combines
      :result   (peek combines)}))
 
-
 (defn fold
   "Executes a fold on the given executor and returns its result."
   [^Executor executor fold]

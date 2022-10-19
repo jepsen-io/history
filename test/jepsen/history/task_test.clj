@@ -46,3 +46,49 @@
             c (t/submit! e :c [a b] (log! :c))
             c-res [:c {1 a-res, 2 b-res}]
             _ (is (= c-res @c))]))))
+
+(deftest cancel-test
+  (let [e    (t/executor)
+        log  (atom [])
+        ; A little worker fn that logs [:start name], then waits for a promise,
+        ; then logs [:end name].
+        log! (fn [name promise] (fn [inputs]
+                                  (swap! log conj [:start name])
+                                  @promise
+                                  (swap! log conj [:end name])))
+        ; Submit a task
+        ap (promise)
+        a (t/submit! e :a nil (log! :a ap))
+        ; a runs immediately, but blocks on the ap promise
+        ; Add a second task that depends on a, and a third that depends on b
+        bp (promise)
+        cp (promise)
+        b (t/submit! e :b [a] (log! :b bp))
+        c (t/submit! e :c [b] (log! :c cp))
+        ; Add a fourth that doesn't depend on anything, just to make sure
+        ; things still work
+        dp (promise)
+        d (t/submit! e :d [] (log! :d dp))
+        ; Cancel a. This should also cancel b and c should be
+        ; descheduled.
+        state1 (t/txn! e (fn [state]
+                           (t/cancel-task state a)))
+        _ (is (= [[:cancel-task a] [:cancel-task b] [:cancel-task c]]
+                 (:effects state1)))
+        ; Allow a to continue
+        _ (deliver ap true)
+        ; A should have blown up during execution
+        _ (is (thrown? InterruptedException @a))
+        ; Even if we let b and c run, b and c should not have executed at all,
+        ; but a should have started. D runs to completion, since it had no
+        ; deps. Not sure how to do this without a sleep; unfortunately this is
+        ; fragile.
+        _ (deliver bp true)
+        _ (deliver cp true)
+        _ (deliver dp true)
+        _ (Thread/sleep 10)
+        _ (is (= [[:start :a]
+                  [:start :d]
+                  [:end :d]]
+                 @log))
+        ]))
