@@ -136,9 +136,9 @@
   a fold to the executor returns a Handle. Handles support the usual IDeref to
   block on results and receive exceptions. They also support additional
   control-flow functions for launching and cancelling folds."
-  (:require [clojure [pprint :refer [pprint]]]
+  (:require [clojure [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn]]
-            [dom-top.core :refer [loopr]]
+            [dom-top.core :refer [assert+ loopr]]
             [jepsen.history [core :as hc]
                             [task :as task]])
   (:import (io.lacuna.bifurcan DirectedGraph
@@ -151,6 +151,7 @@
 ; results for each individual fold it contains.
 (defrecord FusedFold
   [; These fields let us work transparently like any other fold map
+   name
    reducer-identity
    reducer
    post-reducer
@@ -160,6 +161,16 @@
    associative?
    ; But we also track a vector of the original folds we're now fusing.
    folds])
+
+; Debugging with full fn values is exhausting
+(defmethod pprint/simple-dispatch jepsen.history.fold.FusedFold
+  [fold]
+  (.write ^java.io.Writer *out*
+          (str "(FusedFold " (pr-str (:name fold))
+               (when (:associative? fold)
+                 " :assoc") " "
+               ;(pr-str (:folds fold)))
+               )))
 
 (defn fused?
   "Is this fold a fused fold?"
@@ -281,7 +292,8 @@
                      (fn split-unfused [^objects accs]
                        [(aget accs 0) (aget accs 1)]))
         fused (map->FusedFold
-                {:reducer-identity  reducer-identity
+                {:name              [(:name old-fold) (:name new-fold)]
+                 :reducer-identity  reducer-identity
                  :reducer           reducer
                  :post-reducer      post-reducer
                  :combiner-identity combiner-identity
@@ -336,18 +348,6 @@
                            (post-combiner res)
                            res)))))))
 
-(defn make-split-task
-  "Takes a task executor state, a function that splits an accumulator, an index
-  to extract from that accumulator, and a task producing that accumulator.
-  Returns [state' task], where task returns the given index in the accumulator
-  task."
-  [state split-accs i acc-task]
-  (task/new-task+ state
-                  [:split]
-                  [acc-task]
-                  (fn split [_]
-                    (nth (split-accs @acc-task) i))))
-
 (defn make-deliver-task
   "Takes a task executor state, a final combine task, and a function which
   delivers results to the output of a fold. Returns [state' task], where task
@@ -359,13 +359,25 @@
                   (fn deliver [_]
                     (deliver-fn @task))))
 
-(defn make-join-task
-  "Takes a task executor state, a function that joins two accumulator, and
-  accumulator tasks a and b. Returns [state' task], where task returns the two
-  accumulators joined."
-  [state join-accs a-task b-task]
+(defn make-split-task
+  "Takes a task executor state, a name, a function that splits an accumulator,
+  an index to extract from that accumulator, and a task producing that
+  accumulator. Returns [state' task], where task returns the given index in the
+  accumulator task."
+  [state name split-accs i acc-task]
   (task/new-task+ state
-                  [:join]
+                  name
+                  [acc-task]
+                  (fn split [_]
+                    (nth (split-accs @acc-task) i))))
+
+(defn make-join-task
+  "Takes a task executor state, a name, a function that joins two accumulator,
+  and accumulator tasks a and b. Returns [state' task], where task returns the
+  two accumulators joined."
+  [state name join-accs a-task b-task]
+  (task/new-task+ state
+                  name
                   [a-task b-task]
                   (fn join [_]
                     (join-accs @a-task @b-task))))
@@ -385,7 +397,7 @@
   required to execute this pass. Returns [state' pass']."
   [state {:keys [chunks fold deliver] :as pass}]
   (let [n (count chunks)]
-    (loop [i              0
+    (loop [i             0
            state         state
            reduce-tasks  []
            combine-tasks []]
@@ -399,15 +411,15 @@
                                    (nth combine-tasks (dec i)) reduce-task))]
           (recur (inc i)
                  state
-                 (conj reduce-tasks reduce-task)
+                 (conj reduce-tasks  reduce-task)
                  (conj combine-tasks combine-task)))
         ; Done!
         (let [[state task] (make-deliver-task state (nth combine-tasks (dec n))
                                               deliver)]
           [state
            (assoc pass
-                  :reduce-tasks  reduce-tasks
-                  :combine-tasks combine-tasks)])))))
+                  :reduce-tasks  (mapv task/id reduce-tasks)
+                  :combine-tasks (mapv task/id combine-tasks))])))))
 
 (defn join-concurrent-pass
   "Takes a task executor State, and a pair of Passes; the first (potentially)
@@ -439,13 +451,18 @@
   ; possible.
   (let [; First, we're going to need a fused fold, and a function to join
         ; accumulators/reducers.
-        {:keys [fused join-accs split-accs]}
-        (fuse (:fold old-pass) (:fold new-pass))
         chunks               (:chunks old-pass)
         n                    (count chunks)
         _                    (assert (identical? chunks (:chunks new-pass)))
         old-fold             (:fold old-pass)
         new-fold             (:fold new-pass)
+        ; Fuse folds
+        {:keys [fused join-accs split-accs]} (fuse old-fold new-fold)
+        _ (when-not (:name old-fold)
+            (warn :malformed-old-fold
+                  (with-out-str (pprint old-fold))))
+        _ (info :joining (:name old-fold) "with" (:name new-fold)
+                "over" n "chunks")
         old-reduce-task-ids  (:reduce-tasks old-pass)
         old-combine-task-ids (:combine-tasks old-pass)
         ; Now, like twitter, the goal of the game is to produce a pass which is
@@ -470,7 +487,8 @@
         ; Creates a task and mutates the state, returning task.
         task!             (fn task! [f & args]
                             (let [[state' task] (apply f @vstate args)]
-                              (vreset! vstate state')))
+                              (vreset! vstate state')
+                              task))
         ; Cancels a task in the mutable state
         cancel!           (fn cancel! [task]
                             (vswap! vstate task/cancel-task))
@@ -480,6 +498,8 @@
         get-task          (partial task/get-task state)
         old-reduce-tasks  (object-array (map get-task old-reduce-task-ids))
         old-combine-tasks (object-array (map get-task old-combine-task-ids))
+        _ (info :old-reduce-tasks (vec old-reduce-tasks))
+        _ (info :old-combine-tasks (vec old-combine-tasks))
         ; Array of tasks, one per chunk, for the new fold's reduce/combine
         ; tasks. Elements created as needed, never modified
         new-reduce-tasks  (object-array n)
@@ -495,7 +515,8 @@
                                ; it
                                (when-let [rt (aget reduce-tasks i)]
                                  (aset new-reduce-tasks i
-                                       (task! make-split-task split-accs 1 rt)))
+                                       (task! make-split-task [:split-reduce i]
+                                              split-accs 1 rt)))
                                ; Create a new reduce task
                                (aset new-reduce-tasks i
                                      (task! make-reduce-task new-fold chunks i))))
@@ -508,7 +529,7 @@
               ; If we have a joined combine task, split it
               (when-let [ct (aget combine-tasks i)]
                 (aset new-combine-tasks i
-                      (task! make-split-task split-accs 1 ct)))
+                      (task! make-split-task [:split-combine] split-accs 1 ct)))
               ; We can create the first combine task from scratch
               (when (= i 0)
                 (let [rt (new-reduce-task! i)
@@ -552,7 +573,7 @@
                           ; Something in there has already started reducing.
                           ; Let it run and join its acc to a new reduce task.
                           (let [new-rt (new-reduce-task! i)]
-                            (task! make-join-task :reduce-join
+                            (task! make-join-task [:reduce-join i]
                                    join-accs old-rt new-rt)))))
               ; Right, we don't have the old reduce task. Nothing we can do
               ; here.
@@ -576,8 +597,9 @@
                                        nil)
                                      [task]))
                     ; Can we cancel all of these?
-                    old-ct-cancellable? (every? (partial task/pending? state)
-                                                (real-old-cts old-ct))]
+                    old-ct-cancellable? (when old-ct
+                                          (every? (partial task/pending? state)
+                                                (real-old-cts old-ct)))]
                 (or ; For the first task, we can create it from scratch given a
                     ; reduce task.
                     (when (and (= i 0) rt)
@@ -598,8 +620,8 @@
                     (when old-ct
                       (when-let [new-ct (new-combine-task! i)]
                         (aset combine-tasks i
-                              (task! make-join-task :combine-join join-accs
-                                     old-ct new-ct))))
+                              (task! make-join-task [:combine-join i]
+                                     join-accs old-ct new-ct))))
 
                     ; Right, nothing else we can do locally at chunk i
                     ))))
@@ -631,26 +653,42 @@
                   (new-reduce-task! i))))
 
         ; Now we need a combine task for the final chunk.
-        combine-task (combine-task! (dec n))
-        ; And side effects: delivering results
-        old-deliver (:deliver old-pass)
-        new-deliver (:deliver new-pass)
-        deliver-fn (fn deliver-acc [acc]
-                     (let [[old-acc new-acc] (split-accs acc)]
-                       (old-deliver old-acc)
-                       (new-deliver new-acc)))
-        state' @vstate
-        [state' deliver-task] (make-deliver-task state' combine-task deliver-fn)
+        combine-task (combine-task! (dec n))]
+    ; We could have gotten something completely unmergeable--for instance,
+    ; every task already ran.
+    (if-not combine-task
+      ; If this happens, just launch the new pass on the original state.
+      (do (assert+ (every? nil? old-combine-tasks)
+                   {:type :final-combine-missing-weird-plan
+                    :old-reduce-tasks (vec old-reduce-tasks)
+                    :old-combine-tasks (vec old-combine-tasks)
+                    :state state
+                    :state' @vstate})
+        (launch-concurrent-pass state new-pass))
+      ; Right, new plan is a go.
+      (let [; side effects: delivering results
+            old-deliver (:deliver old-pass)
+            new-deliver (:deliver new-pass)
+            deliver-fn (fn deliver-acc [acc]
+                         (let [[old-acc new-acc] (split-accs acc)]
+                           (old-deliver old-acc)
+                           (new-deliver new-acc)))
+            state' @vstate
+            [state' deliver-task]
+            (make-deliver-task state' combine-task deliver-fn)
 
-        ; Right, now we go back and garbage collect every task *not* involved
-        ; in producing our output.
-        state' (task/gc state' deliver-task)]
-  ; And construct our new pass.
-  {:type          :concurrent
-   :chunks        chunks
-   :reduce-tasks  (vec reduce-tasks)
-   :combine-tasks (vec combine-tasks)
-   :deliver       deliver-fn}))
+            ; Right, now we go back and garbage collect every task *not*
+            ; involved in producing our output.
+            state' (task/gc state' [deliver-task]
+                            (concat old-reduce-tasks old-combine-tasks))]
+        ; And construct our new pass.
+        [state'
+         {:type          :concurrent
+          :fold          fused
+          :chunks        chunks
+          :reduce-tasks  (vec reduce-tasks)
+          :combine-tasks (vec combine-tasks)
+          :deliver       deliver-fn}]))))
 
 (deftype Executor
   [task-executor
@@ -663,7 +701,27 @@
   (Executor. (task/executor)
              history
              (atom {:concurrent nil
-                    :linear nil})))
+                    :linear     nil})))
+
+(defn clear-old-passes!
+  "Takes an Executor and clears out any old pass state."
+  [^Executor e]
+  (let [task-executor (.task-executor e)]
+    (locking e
+      (swap! @(.passes e)
+             (fn clear [passes]
+               (let [state (task/executor-state task-executor)]
+                 (loopr [passes' passes]
+                        [[type pass] passes]
+                        (case type
+                          :concurrent
+                          (if (task/pending? state
+                                               (peek (:combine-tasks pass)))
+                            passes
+                            (assoc passes type nil))
+
+                          :linear
+                          passes))))))))
 
 (defn empty-fold
   "Runs a fold over zero elements."
@@ -753,19 +811,32 @@
   [^Executor e fold]
   (let [exec       (.task-executor e)
         history    (.history e)
+        passes     (.passes e)
         chunks     (hc/chunks history)
         result     (promise)
-        deliver-fn (partial deliver result)
-        p          (concurrent-pass chunks fold deliver-fn)
-        pass       (atom nil)]
-    (task/txn! exec
-               (fn txn [state]
-                 (let [p         (concurrent-pass chunks fold deliver-fn)
-                       [state p] (launch-concurrent-pass state p)]
-                   (reset! pass p)
-                   state)))
-    (assoc @pass
-           :result result)))
+        deliver-fn (fn [r]
+                     (deliver result r)
+                     (clear-old-passes! e))
+        new-pass   (concurrent-pass chunks fold deliver-fn)
+        resulting-pass (atom nil)]
+    ; We're about to go do some VERY heavy computation on the executor, and
+    ; don't want anyone else clobbering the pass state while we're here.
+    (locking e
+      (let [old-pass (:concurrent @passes)]
+        (task/txn! exec
+                   (fn txn [state]
+                     (let [[state pass]
+                           (if old-pass
+                             (join-concurrent-pass state old-pass new-pass)
+                             (launch-concurrent-pass state new-pass))]
+                       (reset! resulting-pass pass)
+                       state))))
+      (swap! passes assoc :concurrent @resulting-pass))
+    (let [pass @resulting-pass]
+      (when (fused? (:fold pass))
+        (info "Joined!"
+              (with-out-str (pprint pass))))
+      (assoc pass :result result))))
 
 (defn fold
   "Executes a fold on the given executor and returns its result."

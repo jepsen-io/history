@@ -4,9 +4,10 @@
             [clojure.test.check [clojure-test :refer :all]
                                 [generators :as gen]
                                 [properties :as prop]
-                                [results :refer [Result]]
+                                [results :as results :refer [Result]]
                                 [rose-tree :as rose]]
             [clojure.tools.logging :refer [info warn]]
+            [dom-top.core :refer [real-pmap]]
             [jepsen.history [core :as hc]
                             [fold :as f]
                             [task :as t]])
@@ -14,7 +15,7 @@
 
 (def n
   "How aggressive should tests be?"
-  10000)
+  1000)
 
 (defn reporter-fn
   "A reporter that pretty-prints failures, because oh my god these are so hard
@@ -39,7 +40,6 @@
                 (binding [clojure.test.check.clojure-test/*default-opts*
                           {:reporter-fn reporter-fn}]
                   (run-tests))))
-
 
 (def small-pos-int
   "A nonzero positive integer."
@@ -135,6 +135,16 @@
                        (fold-fuse-gen fold-gen fold-gen))
                      basic-fold-gen))
 
+(defn slow-fold-gen
+  "Takes a fold gen and makes its reducers slow."
+  [fold-gen]
+  (gen/let [fold fold-gen]
+    (assoc fold
+           :name [:slow (:name fold)]
+           :reducer (fn slow [acc x]
+                      (Thread/sleep 100)
+                      ((:reducer fold) acc x)))))
+
 (defn apply-fold-with-reduce
   "Applies a fold naively using reduce"
   [{:keys [reducer-identity
@@ -150,7 +160,7 @@
        (combiner (combiner-identity))
        post-combiner))
 
-(defspec fold-equiv n
+(defspec fold-equiv-serial n
   (prop/for-all [dogs       dogs-gen
                  chunk-size small-pos-int
                  fold       fold-gen]
@@ -158,7 +168,7 @@
                   (binding [;*out* stdout
                             ;*err* stdout
                             ]
-                    (prn :active (Thread/activeCount))
+                    ;(prn :active (Thread/activeCount))
                     (let [executor   (f/executor (hc/chunked chunk-size dogs))
                           model-res  ((:model fold) dogs)
                           reduce-res (apply-fold-with-reduce fold dogs)
@@ -172,3 +182,43 @@
                            :reduce reduce-res
                            :exec   exec-res
                            :log    (str stdout)})))))))
+
+(defn test-fold
+  "Runs fold on executor, returning a test.check Result"
+  [executor dogs fold]
+  (let [model-res  ((:model fold) dogs)
+        reduce-res (apply-fold-with-reduce fold dogs)
+        exec-res   (f/fold executor fold)]
+    (reify Result
+      (pass? [_]
+        (= model-res reduce-res exec-res))
+
+      (result-data [_]
+        {:name   (:name fold)
+         :model  model-res
+         :reduce reduce-res
+         :exec   exec-res}))))
+
+(defn all-results
+  "A Result from a seq of Results"
+  [results]
+  (reify Result
+    (pass? [_]
+      (every? results/pass? results))
+
+    (result-data [_]
+      (first (remove results/pass? results)))))
+
+(defspec ^:focus fold-equiv-parallel n
+  (prop/for-all [dogs       dogs-gen
+                 chunk-size small-pos-int
+                 ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
+                 folds      (gen/vector basic-fold-gen)]
+                ; Just for now, cuz all I implemented was concurrent folds
+                (let [folds (mapv #(assoc % :associative? true) folds)]
+                  (info "parallel dogs" (count dogs) "chunk-size" chunk-size
+                        "folds" (mapv :name folds))
+                  (let [executor (f/executor (hc/chunked chunk-size dogs))
+                        results  (real-pmap (partial test-fold executor dogs)
+                                            folds)]
+                    (all-results results)))))

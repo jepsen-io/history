@@ -164,10 +164,13 @@
 (defn ^Task get-task
   "Fetches a Task from a state by ID."
   [^State state, task-id]
+  ;(info :get-task (.dep-graph state) task-id)
   (let [^DirectedGraph dep-graph (.dep-graph state)
-        ^OptionalLong  i         (.indexOf dep-graph task-id)]
+        ; Taking advantage of our weird-ass equality/hashing semantics
+        ^OptionalLong i (.indexOf dep-graph
+                                  (Task. task-id nil nil nil nil nil))]
     (when (.isPresent i)
-      (.nth dep-graph (.getLong i)))))
+      (.nth dep-graph (.getAsLong i)))))
 
 (defn pending?
   "Takes a state and a task. Returns true iff that task is still pending
@@ -188,7 +191,8 @@
         ; A Function which finds dependencies of a task
         deps (reify Function
                (apply [_ task]
-                 (task-deps task)))]
+                 (or (task-deps task)
+                     [])))]
     (loopr []
            [t (Graphs/bfsVertices task deps)]
            (and (not (.contains running t))
@@ -310,17 +314,19 @@
         dependents (reify Function
                      (apply [_ task]
                        (.out dep-graph task)))]
-    (loopr [^DirectedGraph dep-graph' (.linear dep-graph)
-            ^ISet ready-tasks'        (.linear ^ISet (.ready-tasks state))
-            ^ISet running-tasks'      (.linear ^ISet (.running-tasks state))]
-           [t (Graphs/bfsVertices task dependents)]
-           (recur (.remove dep-graph'     t)
-                  (.remove ready-tasks'   t)
-                  (.remove running-tasks' t))
-           (assoc state
-                  :dep-graph     (.forked dep-graph')
-                  :ready-tasks   (.forked ready-tasks')
-                  :running-tasks (.forked running-tasks')))))
+    (if (.contains ^ISet (.vertices dep-graph) task)
+      (loopr [^DirectedGraph dep-graph' (.linear dep-graph)
+              ^ISet ready-tasks'        (.linear ^ISet (.ready-tasks state))
+              ^ISet running-tasks'      (.linear ^ISet (.running-tasks state))]
+             [t (Graphs/bfsVertices task dependents)]
+             (recur (.remove dep-graph'     t)
+                    (.remove ready-tasks'   t)
+                    (.remove running-tasks' t))
+             (assoc state
+                    :dep-graph     (.forked dep-graph')
+                    :ready-tasks   (.forked ready-tasks')
+                    :running-tasks (.forked running-tasks')))
+      state)))
 
 (defn gc
   "Takes a state, a collection of goal tasks you'd like to achieve, and a set of
@@ -330,12 +336,17 @@
   (let [^DirectedGraph dep-graph (.dep-graph state)
         deps (reify Function
                (apply [_ task]
-                 (.in dep-graph task)))
+                 (try (.in dep-graph task)
+                      (catch IllegalArgumentException e
+                        (throw (ex-info {:type ::no-such-task
+                                         :task task
+                                         :state state}))))))
         ; Walk the graph backwards from goal, cancelling tasks
         to-delete (loopr [to-delete (.linear (Set/from to-delete))]
-                         [t (Graphs/bfsVertices goal deps)]
+                         [t (Graphs/bfsVertices ^Iterable goal deps)]
                          (recur (.remove to-delete t)))]
-    (reduce cancel-task to-delete)))
+    (info "GCing" (.size to-delete) "unneeded tasks")
+    (reduce cancel-task state to-delete)))
 
 (defn state-queue-claim-task*!
   "A support function for StateQueue.run. Definitely don't call this yourself.
