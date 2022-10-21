@@ -19,6 +19,7 @@
                                List
                                Map
                                Set)
+           (java.util OptionalLong)
            (java.util.concurrent ArrayBlockingQueue
                                  BlockingQueue
                                  ExecutorService
@@ -126,15 +127,19 @@
 ; work from.
 (defrecord State
   [^long          next-task-id
+   executor
    ^DirectedGraph dep-graph
    ^ISet          ready-tasks
    ^ISet          running-tasks
    ^IList         effects])
 
 (defn state
-  "Constructs a new executor state. States have five parts:
+  "Constructs a new executor state. States have six parts:
 
   - The next task ID we'll hand out
+
+  - The executor wrapping this state. We need this to close the loop on task
+    side effects.
 
   - A graph of dependencies between tasks. Iff a -> b, b depends on a's
     results. Once tasks are completed, they're removed from this graph.
@@ -150,10 +155,46 @@
     apply-effects!) later, and popped off the list as this occurs."
   []
   (State. 0
+          nil
           (.forked (DirectedGraph.))
           (.forked (Set.))
           (.forked (Set.))
           (.forked (List.))))
+
+(defn ^Task get-task
+  "Fetches a Task from a state by ID."
+  [^State state, task-id]
+  (let [^DirectedGraph dep-graph (.dep-graph state)
+        ^OptionalLong  i         (.indexOf dep-graph task-id)]
+    (when (.isPresent i)
+      (.nth dep-graph (.getLong i)))))
+
+(defn pending?
+  "Takes a state and a task. Returns true iff that task is still pending
+  execution, and can be safely cancelled."
+  [^State state, task]
+  (let [^DirectedGraph dep-graph (.dep-graph state)
+        ^ISet          running   (.running-tasks state)]
+    (and (not (.contains running task))
+         (.contains ^ISet (.vertices dep-graph) task))))
+
+(defn all-deps-pending?
+  "Takes a state and a task. Walks that task's dependency graph, returning true
+  iff every dependency is pending."
+  [^State state, task]
+  (let [^DirectedGraph  dep-graph (.dep-graph state)
+        ^ISet           tasks     (.vertices dep-graph)
+        ^ISet           running   (.running-tasks state)
+        ; A Function which finds dependencies of a task
+        deps (reify Function
+               (apply [_ task]
+                 (task-deps task)))]
+    (loopr []
+           [t (Graphs/bfsVertices task deps)]
+           (and (not (.contains running t))
+                (.contains tasks t)
+                (recur))
+           true)))
 
 (defn state-done?
   "Returns true when a state has nothing ready, nothing running, and nothing in
@@ -166,16 +207,16 @@
 (defn new-task
   "Given a state, constructs a fresh task with the given name, collection of
   Tasks as dependencies, a function (f dep-results) which takes a map of
-  dependency IDs to their results, and an Executor to inform when the task is
-  done. Returns the state with the new task integrated, including a [:new-task
-  task], which you can use to read the created task.
+  dependency IDs to their results. Returns the state with the new task
+  integrated, including a [:new-task task], which you can use to read the
+  created task.
 
   If the task has no dependencies, it may be ready immediately; the :new-task
   effect will be followed by a [:ready-task task] effect. In either case, the
   final effect *will* contain the newly created task."
-  [^State state name deps f executor]
+  [^State state name deps f]
   (let [id         (.next-task-id state)
-        task       (Task. id name deps f (promise) executor)
+        task       (Task. id name deps f (promise) (.executor state))
         ; Update dependency graph
         ^DirectedGraph dep-graph (.dep-graph state)
         ^DirectedGraph dep-graph'
@@ -213,6 +254,13 @@
            :dep-graph     dep-graph'
            :ready-tasks   ready-tasks'
            :effects       effects')))
+
+(defn new-task+
+  "Like new-task, but returns [state new-task]. Useful for transactional task
+  creation."
+  [state name deps f]
+  (let [^State state' (new-task state name deps f)]
+    [state' (nth (.last ^IList (.effects state')) 1)]))
 
 (defn finish-task
   "Takes a state and a task which has been executed, and marks it as completed.
@@ -273,6 +321,21 @@
                   :dep-graph     (.forked dep-graph')
                   :ready-tasks   (.forked ready-tasks')
                   :running-tasks (.forked running-tasks')))))
+
+(defn gc
+  "Takes a state, a collection of goal tasks you'd like to achieve, and a set of
+  tasks you might like to cancel. Cancels all tasks not contributing to the
+  goal, returning a new state."
+  [^State state, goal, to-delete]
+  (let [^DirectedGraph dep-graph (.dep-graph state)
+        deps (reify Function
+               (apply [_ task]
+                 (.in dep-graph task)))
+        ; Walk the graph backwards from goal, cancelling tasks
+        to-delete (loopr [to-delete (.linear (Set/from to-delete))]
+                         [t (Graphs/bfsVertices goal deps)]
+                         (recur (.remove to-delete t)))]
+    (reduce cancel-task to-delete)))
 
 (defn state-queue-claim-task*!
   "A support function for StateQueue.run. Definitely don't call this yourself.
@@ -380,8 +443,12 @@
                                         procs ; max pool
                                         1 TimeUnit/SECONDS ; keepalive
                                         state-queue)
-               (.allowCoreThreadTimeOut true))]
-    (Executor. exec state)))
+               (.allowCoreThreadTimeOut true))
+        this (Executor. exec state)]
+    ; Tie the knot: the state needs to have a reference back to the executor so
+    ; tasks created on it can clear themselves from our state when finished
+    (swap! state assoc :executor this)
+    this))
 
 (defn executor-state
   "Reads the current state of an Executor."
@@ -425,31 +492,14 @@
   "Executes a transaction on an executor. Takes an executor and a function
   which transforms that executor's State. Applies that function to the
   executor's state, then applies any pending side effects. Returns the state
-  the function returned.
-
-  Note that this txn may immediately advance the state in other way, and
-  execute other side effects. For instance, it might queue up newly-added tasks
-  whose dependencies are satisfiable. These side effects are not included in
-  this function's return value: it's as if they took place 'automatically' just
-  after the transaction finished."
+  the function returned."
   [^Executor executor, f]
-  (let [caller-state (atom nil)]
-    (swap! (.state executor)
-           (fn txn [state]
-             (let [state' (f state)]
-               ; Save the state the caller returned
-               (reset! caller-state state')
-               ; Now we may have tasks that are ready as a result of their
-               ; actions
-               ; -> Nope, changed my mind: all transition functions maintain
-               ; :ready-tasks themselves
-               ;(ready-tasks state'))
-               state')))
+  (let [state' (swap! (.state executor) f)]
     ;(info :txn! (with-out-str (pprint @caller-state)))
     ; Apply side effects
     (apply-effects! executor)
     ; Return caller's generated state
-    @caller-state))
+    state'))
 
 (defn finish-task!
   "Tells an executor that a task is finished."
@@ -462,6 +512,6 @@
   dependency IDs to their results. Returns a newly created Task object."
   [executor name deps f]
   (let [; Create the task
-        ^State state' (txn! executor #(new-task % name deps f executor))
+        ^State state' (txn! executor #(new-task % name deps f))
         [_ task] (.last ^IList (.effects state'))]
     task))

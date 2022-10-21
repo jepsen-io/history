@@ -14,7 +14,7 @@
 
 (def n
   "How aggressive should tests be?"
-  100)
+  10000)
 
 (defn reporter-fn
   "A reporter that pretty-prints failures, because oh my god these are so hard
