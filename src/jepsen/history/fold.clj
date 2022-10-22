@@ -390,14 +390,16 @@
   "We may have a join task which unifies work from two different reducers. If
   we cancel just the join, the reducers will still run. This takes a state and
   a reduce task, walks the dependency tree, and figures out if all the actual
-  work involved in this particular chunk is still pending."
+  work involved in this particular chunk is still pending. You can also pass
+  :cancelled as a task; this is always pending."
   [state task]
-  (and (task/pending? state task)
-       (or ; We're a real combine task doing work
-           (:reduce (first (task/name task)))
-           ; We're a join task
-           (every? (partial reduce-task-work-pending? state)
-                   (task/task-deps task)))))
+  (or (identical? task :cancelled)
+      (and (task/pending? state task)
+           (or ; We're a real combine task doing work
+               (:reduce (first (task/name task)))
+               ; We're a join task
+               (every? (partial reduce-task-work-pending? state)
+                       (task/task-deps task))))))
 
 (defn combine-task-work-pending?
   "We may have a combine task which joins work from multiple combine tasks. If
@@ -405,15 +407,32 @@
   a combine task, and returns true if all the actual work for this particular
   combine chunk is actually pending. Note that we take advantage of combine
   tasks' dependency order: the previous combine task is always the second
-  dependency."
+  dependency. You can also pass :cancelled as a task; this is always pending."
   [state task]
   ;(info :task task :pending (task/pending? state task) :combine? (
-  (and (task/pending? state task)
-       (or ; We're a real combine task doing work
-           (= :combine (first (task/name task)))
-           ; We're a join task
-           (every? (partial combine-task-work-pending? state)
-                   (task/task-deps task)))))
+  (or (identical? task :cancelled)
+      (and (task/pending? state task)
+           (or ; We're a real combine task doing work
+               (= :combine (first (task/name task)))
+               ; We're a join task
+               (every? (partial combine-task-work-pending? state)
+                       (task/task-deps task))))))
+
+(defn cancel-task-work-for-chunk
+  "Takes a state and a reduce, combine, split, or join task. Cancels not only
+  this task, but all of its dependencies which actually perform the work for
+  its particular chunk. Returns state'.
+
+  A task of :cancelled yields no changes."
+  [state task]
+  (if (identical? task :cancelled)
+    state
+    (case (first (task/name task))
+      (:reduce, :combine)
+      (task/cancel-task state task)
+
+      (:split-reduce, :split-combine, :join-reduce, :join-combine)
+      (reduce cancel-task-work-for-chunk state (task/task-deps task)))))
 
 ; Pass construction
 (defn concurrent-pass
@@ -488,19 +507,24 @@
                       [task tasks]
                       (do (when (pos? i)
                             (.append sb " "))
-                          (if-not (task/has-task? state task)
-                            (.append sb ". ")
-                            (do (.append sb
-                                         (case (first (task/name task))
-                                           :join-combine  ">"
-                                           :split-combine "<"
-                                           :join-reduce   ">"
-                                           :split-reduce  "<"
-                                           :combine       "C"
-                                           :reduce        "R"))
-                                (.append sb (if (task/pending? state task)
-                                              " "
-                                              "!"))))
+                          (cond (= :cancelled task)
+                                (.append sb "x ")
+
+                                (not (task/has-task? state task))
+                                (.append sb ". ")
+
+                                true
+                                (do (.append sb
+                                             (case (first (task/name task))
+                                               :join-combine  ">"
+                                               :split-combine "<"
+                                               :join-reduce   ">"
+                                               :split-reduce  "<"
+                                               :combine       "C"
+                                               :reduce        "R"))
+                                    (.append sb (if (task/pending? state task)
+                                                  " "
+                                                  "!"))))
                           (recur (inc i))))
                (.append sb "]\n")
                (recur)))
@@ -534,7 +558,8 @@
   ;
   ; Our goal is to produce a single final combiner task as efficiently as
   ; possible.
-  (let [; First, we're going to need a fused fold, and a function to join
+  (let [;_ (assert+ (instance? jepsen.history.task.State state))
+        ; First, we're going to need a fused fold, and a function to join
         ; accumulators/reducers.
         chunks               (:chunks old-pass)
         n                    (count chunks)
@@ -550,6 +575,23 @@
                 "over" n "chunks")
         old-reduce-task-ids  (:reduce-tasks old-pass)
         old-combine-task-ids (:combine-tasks old-pass)
+        get-task          (fn get-task [task-id]
+                            (when task-id
+                              (task/get-task state task-id)))
+        ; Array of tasks, one per chunk, for the old fold's reduce/combine
+        ; tasks, derived the current task executor state. Basically lazy
+        ; caches. nil means we don't know, :cancelled means we cancelled the
+        ; task. We mutate these two arrays as we go.
+        old-reduce-tasks  (object-array (map get-task old-reduce-task-ids))
+        old-combine-tasks (object-array (map get-task old-combine-task-ids))
+        ; Array of tasks, one per chunk, for the new fold's reduce/combine
+        ; tasks. Elements created as needed, never modified
+        new-reduce-tasks  (object-array n)
+        new-combine-tasks (object-array n)
+        ; Same arrays, same rules, but for the joined reduce/combine tasks.
+        reduce-tasks      (object-array n)
+        combine-tasks     (object-array n)
+
         ; Now, like twitter, the goal of the game is to produce a pass which is
         ; maximally cancellable. The more of our reductions we can cancel
         ; later, the less duplicate work gets done, and the more we take
@@ -574,79 +616,79 @@
                             (let [[state' task] (apply f @vstate args)]
                               (vreset! vstate state')
                               task))
-        ; Cancels a task in the mutable state
+        ; Cancels a task in the mutable state. We also cancel all of the work
+        ; for that chunk, in case it's a split/join task.
         cancel!           (fn cancel! [task]
-                            (vswap! vstate task/cancel-task task))
-        ; Cancels a task in the mutable state, and all of its dependencies.
-        cancel-deps!      (fn cancel-deps! [task]
-                            (mapv cancel! (task/all-task-deps task)))
-        ; Array of tasks, one per chunk, for the old fold's reduce/combine
-        ; tasks, derived the current task executor state. Basically lazy
-        ; caches.
-        get-task          (partial task/get-task state)
-        old-reduce-tasks  (object-array (map get-task old-reduce-task-ids))
-        old-combine-tasks (object-array (map get-task old-combine-task-ids))
-        ; Array of tasks, one per chunk, for the new fold's reduce/combine
-        ; tasks. Elements created as needed, never modified
-        new-reduce-tasks  (object-array n)
-        new-combine-tasks (object-array n)
-        ; Same arrays, same rules, but for the joined reduce/combine tasks.
-        reduce-tasks      (object-array n)
-        combine-tasks     (object-array n)
+                            (vswap! vstate cancel-task-work-for-chunk task))
+        ; When we cancel a combine, we need to mark every later combine as
+        ; cancelled, and we don't want to repeat that work.
+        combines-cancelled-i (volatile! n)
+        ; Cancel an old combine task
+        cancel-old-combine-task! (fn cancel-old-combine-task! [i]
+                                   (when (<= i @combines-cancelled-i)
+                                     (loop [j i]
+                                       (when (< j n)
+                                         (let [ct (aget old-combine-tasks j)]
+                                           (assert+ ct)
+                                           (cancel! ct)
+                                           (aset old-combine-tasks j :cancelled)
+                                           (recur (inc j)))))
+                                     (vreset! combines-cancelled-i i)))
+        ; Cancel an old reduce task
+        cancel-old-reduce-task! (fn cancel-old-reduce-task! [i]
+                                  (let [rt (aget old-reduce-tasks i)]
+                                    (assert+ rt)
+                                    (cancel! rt)
+                                    (aset old-reduce-tasks i :cancelled)
+                                    (cancel-old-combine-task! i)))
 
         _ (info (str "Original folds:\n"
                      (print-join-plan n @vstate
                                       old-reduce-tasks old-combine-tasks
                                       reduce-tasks combine-tasks
                                       new-reduce-tasks new-combine-tasks)))
-
-        ; First pass: reduces. These are easy because they have no
-        ; dependencies. We need to ensure that every reduce executes exactly
-        ; once. That gives us two possible options: either we keep the old
-        ; reduce and create a new one, OR we cancel the old reduce and create a
-        ; joined reduce.
-        ;
         ;  old-reduce [.  R  . ]
         ; old-combine [C  C  C ]
         ;
         ; A wrinkle: here reducer R2 has already been started, but we lost the
         ; reference to it. If we cancel R1, it'll also cancel C2, and we *need*
         ; C2 since it's our only way to see effects of R2. We scan back and
-        ; find the last missing reducer; we can't cancel anything prior.
-        last-missing-reduce-i (loop [i (dec n)]
-                                (if-not (aget old-reduce-tasks i)
-                                  i
-                                  (if (= i 0)
-                                    ; Some of our comparisons are simpler if we
-                                    ; can safely distinguish "first missing"
-                                    ; from "none missing"
-                                    -2
-                                    (recur (dec i)))))
-        last-missing-combine-i (loop [i (dec n)]
-                                 (if-not (aget old-combine-tasks i)
-                                   i
-                                   (if (= i 0)
-                                     ; Some of our comparisons are simpler if we
-                                     ; can safely distinguish "first missing"
-                                     ; from "none missing"
-                                     -2
-                                     (recur (dec i)))))
-        last-missing-i (min last-missing-reduce-i last-missing-combine-i)
+        ; find the last missing reducer; we can't cancel anything prior. Ditto,
+        ; last missing combiner.
+        last-missing-fn (fn last-missing-fn [ary]
+                          (loop [i (dec n)]
+                            (if-not (aget ary i)
+                              i
+                              (if (= i 0)
+                                ; Some of our comparisons are simpler if we
+                                ; can safely distinguish "first missing"
+                                ; from "none missing"
+                                -2
+                                (recur (dec i))))))
+        last-missing-reduce-i  (last-missing-fn old-reduce-tasks)
+        last-missing-combine-i (last-missing-fn old-combine-tasks)
+
+        ; First pass: reduces. These are easy because they have no
+        ; dependencies. We need to ensure that every reduce executes exactly
+        ; once. That gives us two possible options: either we keep the old
+        ; reduce and create a new one, OR we cancel the old reduce and create a
+        ; joined reduce.
+        ;_ (info :last-missing-reduce last-missing-reduce-i
+        ;        :last-missing-combine last-missing-combine-i)
         _ (loop [i 0]
             (when (< i n)
               (let [old-rt (aget old-reduce-tasks i)]
-                (if (and (< last-missing-i (dec i))
+                (if (and (< last-missing-reduce-i i)
+                         (< last-missing-combine-i (dec i))
                          (reduce-task-work-pending? state old-rt))
                   (do ; Replace with a fused reduce
-                      (cancel! old-rt)
-                      ; Just so we don't accidentally use it
-                      (aset old-reduce-tasks i nil)
+                      (cancel-old-reduce-task! i)
                       (aset reduce-tasks i
                             (task! make-reduce-task fused chunks i)))
                   ; We need to start a new reduce task instead.
-                  (do (aset new-reduce-tasks i
-                            (task! make-reduce-task new-fold chunks i))))
-                (recur (inc i)))))
+                  (aset new-reduce-tasks i
+                        (task! make-reduce-task new-fold chunks i))))
+              (recur (inc i))))
 
         ;_ (info (str "New reduce plan:\n"
         ;             (print-join-plan n @vstate
@@ -658,46 +700,31 @@
         ; existing fused combine tasks.
         old-combine-task!
         (fn old-combine-task! [i]
-          (or (aget old-combine-tasks i)
+          (let [ct (aget old-combine-tasks i)]
+            (if (or (nil? ct) (identical? ct :cancelled))
+              ; We don't have it or it was cancelled, but we could maybe split
               (when-let [ct (aget combine-tasks i)]
                 (aset old-combine-tasks i
-                    (task! make-split-task [:split-combine i] split-accs 0
-                           ct)))))
+                      (task! make-split-task [:split-combine i] split-accs 0
+                             ct)))
+              ; We have it
+              ct)))
 
         ; Looks up the old reduce task at i, or creates a split from the
         ; existing fused reduce task.
         old-reduce-task!
         (fn old-reduce-task! [i]
-          (or (aget old-reduce-tasks i)
+          (let [rt (aget old-reduce-tasks i)]
+            (if (or (nil? rt) (identical? rt :cancelled))
+              ; We don't have it, but we can split safely.
               (when-let [rt (aget reduce-tasks i)]
                 (aset old-reduce-tasks i
                       (task! make-split-task [:split-reduce i] split-accs 0
-                             rt)))))
-
-        ; Either looks up the reduce task at index i, or creates a join from
-        ; the existing old/new combine tasks.
-        reduce-task!
-        (fn reduce-task! [i]
-          (or (aget reduce-tasks i)
-              (when-let [old-rt (aget old-reduce-tasks i)]
-                (when-let [new-rt (aget new-reduce-tasks i)]
-                  (aset reduce-tasks i
-                        (task! make-join-task [:join-reduce i] join-accs
-                               old-rt new-rt))))))
-
-        ; Either looks up the combine task at index i, or creates a join from
-        ; the existing old/new combine tasks.
-        combine-task!
-        (fn combine-task! [i]
-          (or (aget combine-tasks i)
-              (when-let [old-ct (aget old-combine-tasks i)]
-                (when-let [new-ct (aget new-combine-tasks i)]
-                  (aset combine-tasks i
-                        (task! make-join-task [:join-combine i] join-accs
-                               old-ct new-ct))))))
+                             rt)))
+              rt)))
 
         ; Looks up the new combine task at i, or creates a split from the
-        ; existing fused combine tasks.
+        ; existing fused combine task.
         new-combine-task!
         (fn new-combine-task! [i]
           (or (aget new-combine-tasks i)
@@ -716,38 +743,43 @@
                       (task! make-split-task [:split-reduce i] split-accs 1
                              rt)))))
 
-        ; Can we do theoretically do a fused combine at index i?
-        fused-combine-possible?
-        (fn fused-combine-possible? [i]
-          (and ; We can't start fusing combines until we get past missing
-               ; reducers/combiners.
-               (< last-missing-i i)
-               ; We need the previous combine task, or both previous old
-               ; and new combine tasks.
-               (or (= 0 i)
-                   (let [i- (dec i)]
-                     (or (aget combine-tasks i-)
-                         (and (aget old-combine-tasks i-)
-                              (aget new-combine-tasks i-)))))
-               ; And we need the current reduce task, or both old
-               ; and new.
-               (or (aget reduce-tasks i)
-                   (and (aget old-reduce-tasks i)
-                        (aget new-reduce-tasks i)))))
+        ; Either looks up the reduce task at index i, or creates a join from
+        ; the existing old/new combine tasks.
+        reduce-task!
+        (fn reduce-task! [i]
+          (or (aget reduce-tasks i)
+              (let [old-rt (aget old-reduce-tasks i)
+                    new-rt (aget new-reduce-tasks i)]
+                ; Can we join?
+                (when (and old-rt
+                           new-rt
+                           (not (identical? :cancelled old-rt))
+                           (or (task/ran? old-rt)
+                               (task/has-task? @vstate old-rt)))
+                  (aset reduce-tasks i
+                        (task! make-join-task [:join-reduce i] join-accs
+                               old-rt new-rt))))))
 
-        ; Can we compute the old combine task at index i?
-        old-combine-computable?
-        (fn old-combine-computable? [i]
-          (and ; We can't start replacing old combines until we get past
-               ; missing reducers.
-               (< last-missing-reduce-i (dec i))
-               ; We need either the old or fused combine task from the prev
-               ; chunk
-               (or (aget old-combine-tasks (dec i))
-                   (aget combine-tasks (dec i)))
-               ; And also the old or fused current reduce task
-               (or (aget old-reduce-tasks i)
-                   (aget reduce-tasks i))))
+        ; Either looks up the combine task at index i, or creates a join from
+        ; the existing old/new combine tasks.
+        combine-task!
+        (fn combine-task! [i]
+          (or (aget combine-tasks i)
+              (and ; We can't start fusing combines until we get past missing
+                   ; reducers/combiners.
+                   (< last-missing-combine-i i)
+                   ; Can we join?
+                   (let [old-ct (aget old-combine-tasks i)
+                         new-ct (aget new-combine-tasks i)]
+                     (when (and old-ct
+                                new-ct
+                                (not (identical? :cancelled old-ct))
+                                (or (task/ran? old-ct)
+                                    (task/has-task? @vstate old-ct)))
+                       ; Join
+                       (aset combine-tasks i
+                             (task! make-join-task [:join-combine i] join-accs
+                                    old-ct new-ct)))))))
 
         ; Second pass: combines. These are trickier because each combine relies
         ; on every previous combine. However, because we want to enforce our
@@ -763,14 +795,17 @@
         ;
         ; Start off with the first combine.
         _ (let [old-ct (aget old-combine-tasks 0)]
-            (if (and (combine-task-work-pending? state old-ct)
-                     (fused-combine-possible? 0))
-                (do ; We can replace this with an initial fused combine task
-                    (cancel! old-ct)
-                    (aset old-combine-tasks 0 nil)
-                    (aset combine-tasks 0
-                          (task! make-combine-task fused chunks 0
-                                 (assert+ (reduce-task! 0)))))
+            (or (and ; Can't start cancelling until we get past last missing.
+                     (< last-missing-reduce-i 0)
+                     (< last-missing-combine-i 0)
+                     ; Can only cancel if work is pending
+                     (combine-task-work-pending? state old-ct)
+                     ; And we need the reduce task
+                     (when-let [rt (reduce-task! 0)]
+                       ; We can replace this with an initial fused combine task
+                       (cancel-old-combine-task! 0)
+                       (aset combine-tasks 0
+                             (task! make-combine-task fused chunks 0 rt))))
                 (do ; Gotta run an independent new initial combine task
                     (aset new-combine-tasks 0
                           (task! make-combine-task new-fold chunks 0
@@ -780,72 +815,54 @@
         ; *previous* chunk.
         _ (loop [i 1]
             (when (< i n)
-              ;_ (info (str "Combine plan up to i = " i "\n"
-              ;             (print-join-plan n @vstate
-              ;                              old-reduce-tasks old-combine-tasks
-              ;                              reduce-tasks combine-tasks
-              ;                              new-reduce-tasks new-combine-tasks)))
+              ;(info (str "Combine plan up to i = " i "\n"
+              ;           (print-join-plan n @vstate
+              ;                            old-reduce-tasks old-combine-tasks
+              ;                            reduce-tasks combine-tasks
+              ;                            new-reduce-tasks new-combine-tasks)))
               (let [old-ct (aget old-combine-tasks i)]
-                (if (combine-task-work-pending? state old-ct)
-                  ; We can cancel the old combine, if we can make a fused one.
-                  (if (fused-combine-possible? i)
-                    ; We have enough information to do a fused combine here.
-                    (let [prev-ct (assert+ (combine-task! (dec i)))
-                          rt      (assert+ (reduce-task! i))]
-                      ; (info "Replacing old combine with fused combine")
-                      (cancel! old-ct)
-                      (aset old-combine-tasks i nil)
-                      (aset combine-tasks i
-                            (task! make-combine-task fused chunks i
-                                   prev-ct rt)))
-                    ; Shoot, gotta do separate combines. We *can* cancel this
-                    ; combine task though. Can we replace it?
-                    (if (old-combine-computable? i)
-                      ; We can compute an old combine task! Gotta do new too.
-                      (let [prev-old-ct (old-combine-task! (dec i))
-                            old-rt      (old-reduce-task! i)]
-                        ;(info "Replacing old combine task")
-                        (cancel! old-ct)
-                        (aset old-combine-tasks i
-                              (task! make-combine-task old-fold chunks i
-                                     (assert+ (old-combine-task! (dec i)))
-                                     (assert+ (old-reduce-task! i))))
+                ; We'd like to cancel the old combine and do a fused one
+                ; instead.
+                (or (and ; Can't start cancelling until we get past last missing
+                         (< last-missing-reduce-i i)
+                         (< last-missing-combine-i (dec i))
+                         ; We need the old ct to be pending...
+                         (combine-task-work-pending? state old-ct)
+                         ; We need both the current reduce task and the
+                         ; previous combine task
+                         (when-let [rt (reduce-task! i)]
+                           (when-let [prev-ct (combine-task! (dec i))]
+                             (cancel-old-combine-task! i)
+                             (aset combine-tasks i
+                                   (task! make-combine-task fused chunks i
+                                          prev-ct rt)))))
+                    ; Fall back to separate old/new combine tasks. Do we need
+                    ; to create an old combine to replace one we cancelled?
+                    (do (when (identical? old-ct :cancelled)
+                          (aset old-combine-tasks i
+                                (task! make-combine-task old-fold chunks i
+                                       (assert+ (old-combine-task! (dec i)))
+                                       (assert+ (old-reduce-task! i)))))
+                        ; And create our new combine task
                         (aset new-combine-tasks i
                               (task! make-combine-task new-fold chunks i
                                      (assert+ (new-combine-task! (dec i)))
-                                     (assert+ (new-reduce-task! i)))))
-                      (do ; Can't compute an old combine task--maybe it's
-                          ; already completed. We have to do a new combine
-                          ; here.
-                          ;(info "Can't compute old combine task; just doing new")
-                          (aset new-combine-tasks i
-                                (task! make-combine-task new-fold chunks i
-                                       (assert+ (new-combine-task! (dec i)))
-                                       (assert+ (new-reduce-task! i)))))))
-                  (do ; Can't cancel old combine.
-                      ;(info "Can't cancel old combine, just doing new.")
-                      ;(info :work-pending? (combine-task-work-pending? state old-ct))
-                      ;(info :old-ct old-ct)
-                      ;(info :state (with-out-str (pprint state)))
-                      (aset new-combine-tasks i
-                            (task! make-combine-task new-fold chunks i
-                                   (assert+ (new-combine-task! (dec i)))
-                                   (assert+ (new-reduce-task! i)))))))
+                                     (assert+ (new-reduce-task! i)))))))
               (recur (inc i))))
 
-        ; Finally, we may need to join the final combine tasks
+        ; Final combine task
         combine-task (combine-task! (dec n))
       ]
 
-    ;(info (str "Combine plan:\n"
-    ;           (print-join-plan n @vstate
-    ;                            old-reduce-tasks old-combine-tasks
-    ;                            reduce-tasks combine-tasks
-    ;                            new-reduce-tasks new-combine-tasks)))
+    (info (str "Combine plan:\n"
+               (print-join-plan n @vstate
+                                old-reduce-tasks old-combine-tasks
+                                reduce-tasks combine-tasks
+                                new-reduce-tasks new-combine-tasks)))
     ;(info "Last missing reduce" last-missing-reduce-i)
-    ; We could have gotten something completely unmergeable. If the last
-    ; reducer is missing, we can't optimize a thing.
-    (if (= (dec n) last-missing-reduce-i)
+    ; We could have gotten something completely unmergeable--for instance, the
+    ; last combiner or reducer could have been missing.
+    (if-not combine-task
       ; If this happens, just launch the new pass on the original state.
       (launch-concurrent-pass state new-pass)
       ; Right, new plan is a go.
@@ -861,12 +878,14 @@
             (make-deliver-task state' combine-task deliver-fn)
 
             ; Right, now we go back and garbage collect every task *not*
-            ; involved in producing our output.
-            state' (task/gc state' [deliver-task]
-                            (concat old-reduce-tasks old-combine-tasks))
+            ; involved in producing our output. Should be able to drop this now
+            ; that we're conservative w/pruning.
+            state' (->> (concat old-reduce-task-ids old-combine-task-ids)
+                        (remove nil?)
+                        (keep (partial task/get-task state'))
+                        (task/gc state' [deliver-task]))
 
             ; Log resulting plan
-            get-task          (partial task/get-task state')
             _ (info (str "Final join plan\n"
                     (print-join-plan n
                                      state'
@@ -1038,9 +1057,12 @@
                        state))))
       (swap! passes assoc :concurrent @resulting-pass))
     (let [pass @resulting-pass]
-      (when (fused? (:fold pass))
+      (if (:joined? pass)
         (info "Joined!"
-              (with-out-str (pprint pass))))
+              (with-out-str (pprint pass)))
+        ;(info "Didn't join!"
+        ;      (with-out-str (pprint pass)))
+        )
       (assoc pass :result result))))
 
 (defn fold

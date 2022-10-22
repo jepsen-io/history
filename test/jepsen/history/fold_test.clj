@@ -65,6 +65,7 @@
 (def fold-count
   "A fold which just counts elements."
   {:name :count
+   :associative? true
    :model count
    :reducer-identity (constantly 0)
    :reducer (fn [count dog] (+ count 1))
@@ -150,14 +151,19 @@
                       (Thread/sleep 100)
                       ((:reducer fold) acc x)))))
 
+(defn concurrent-pass
+  "Constructs a fresh concurrent pass over chunks. Always does an associative
+  count."
+  [chunks]
+  {:type    :concurrent
+   :chunks  chunks
+   :fold    fold-count
+   :deliver (fn [x])})
+
 (defn concurrent-pass-gen
   "Generates a fresh concurrent pass over chunks."
   [chunks]
-  (gen/let [fold basic-fold-gen]
-    {:type    :concurrent
-     :chunks  chunks
-     :fold    fold
-     :deliver (fn [x])}))
+  (concurrent-pass chunks))
 
 (defn launch-concurrent-pass-gen
   "Simulates launching a concurrent pass on state. Returns a generator of
@@ -170,37 +176,90 @@
   "A scaling parameter for number of chunks in concurrent-pass-join tests"
   25)
 
-(defn running-concurrent-pass-gen
-  "A generator of a running concurrent pass on a fresh state, which returns
-  [state0 state' pass]. State0 is the state with all tasks still registered, so
-  you can look up those tasks. State' is the running state. Some of the pass's
-  tasks will have started."
-  [chunks]
-  (gen/let [[state0 pass] (launch-concurrent-pass-gen (t/state) chunks)
-            ops           (gen/scale (fn [size]
-                                       (inc (/ size chunk-scale)))
-                                     (gen/vector
-                                       (gen/elements [:run :finish])))]
-    ; Run some of the tasks
-    (let [; Side effect channel for pulling tasks off state
-          last-task (volatile! nil)]
-      (loopr [state   state0
-              running #{}]
-             [op ops]
-             (case op
-               :run (let [state' (t/state-queue-claim-task*! state last-task)]
-                      (if (identical? state state')
-                        (recur state' running)
-                        (recur state' (conj running @last-task))))
-               :finish (if-let [task (first running)]
-                         (do (.run ^Runnable task)
-                             (recur (t/finish-task state task)
-                                    (disj running task)))
-                         (recur state running)))
-             [; We don't need side effects, and they take up debugging space
-              (assoc state0 :effects (:effects (t/state)))
-              (assoc state :effects (:effects (t/state)))
-              pass]))))
+(def task-state-steps-gen
+  "Generates a sequence of steps to apply to a task executor state."
+  (gen/let [n small-pos-int]
+    (gen/vector (gen/elements [:run :finish]) n)))
+
+(defn apply-task-state-steps
+  "Takes a state and a sequence of steps, and applies those states to the
+  steps, returning the new state (with empty effects)."
+  [state steps]
+  (let [; Side effect channel for pulling tasks off state
+        last-task (volatile! nil)]
+    (loopr [state   state
+            running #{}]
+           [step steps]
+           (case step
+             :run (let [state' (t/state-queue-claim-task*! state last-task)]
+                    (if (identical? state state')
+                      (recur state' running)
+                      (recur state' (conj running @last-task))))
+             :finish (if-let [task (first running)]
+                       (do (.run ^Runnable task)
+                           (recur (t/finish-task state task)
+                                  (disj running task)))
+                       (recur state running)))
+           ; Trim side effects; no need for them here
+           (assoc state :effects (:effects (t/state))))))
+
+(defn join-concurrent-passes
+  "Joins a series of concurrent passes together. Takes a list of chunks, then
+  takes a vector of task executor steps to take before joining each new pass.
+
+  Returns a seq of maps, one for each pass launched, of the form:
+
+    {:chunks
+     :state0   The state before the executor did anything
+     :state    The state going in to the pass join
+     :state'   The state after the pass join
+     :old-pass
+     :new-pass
+     :pass}"
+  [{:keys [chunks task-steps]}]
+  ; First, get an initial pass launched
+  (let [[state0 pass0] (f/launch-concurrent-pass
+                         (t/state)
+                         (concurrent-pass chunks))
+        pass-count (count task-steps)]
+    ; Now step through passes
+    (loop [results    []
+           pass-i     0
+           state0     state0
+           pass       pass0]
+      (if (= pass-i pass-count)
+        ; Done
+        results
+        (let [; Apply steps
+              state (apply-task-state-steps state0 (nth task-steps pass-i))
+              ; Join new pass
+              new-pass (concurrent-pass chunks)
+              [state' pass'] (f/join-concurrent-pass
+                               state pass new-pass)]
+          (recur (conj results {:chunks   chunks
+                                :state0   state0
+                                :state    state
+                                :state'   state'
+                                :old-pass pass
+                                :new-pass new-pass
+                                :pass     pass'})
+                 (inc pass-i)
+                 state'
+                 pass'))))))
+
+(def join-concurrent-passes-inputs-gen
+  "Generates a map of inputs for join-concurrent-passes. Keeping the massive
+  states test.check generates REPL-accessible is a bear."
+  (gen/scale (fn [size]
+               ; No real diff between 5 chunks and 50, and ditto, we want small
+               ; numbers of steps.
+               (inc (/ size chunk-scale 2)))
+             (gen/let [chunks (gen/not-empty (gen/vector (gen/return [])))
+                       pass-count small-pos-int
+                       ; Before each pass, some task steps to take
+                       task-steps (gen/vector task-state-steps-gen pass-count)]
+               {:chunks     chunks
+                :task-steps task-steps})))
 
 (defn passing-result
   "A simple passing result."
@@ -235,23 +294,18 @@
     (result-data [_]
       (results/result-data (first (remove results/pass? results))))))
 
-(defn ran?
-  "Did a task already run?"
-  [^jepsen.history.task.Task task]
-  (realized? (.output task)))
-
 (defn will-run?
   "Will a task eventually complete? Either it already ran, or its in the state,
   *and* all its deps will complete."
   [state task]
-  (or (ran? task)
+  (or (t/ran? task)
       (and (t/has-task? state task)
            (every? (partial will-run? state) (t/task-deps task)))))
 
 (defn could-run?
   "Either it already ran or it's in the state."
   [state task]
-  (or (ran? task)
+  (or (t/ran? task)
       (t/has-task? state task)))
 
 (defn worker?
@@ -261,6 +315,18 @@
     (let [type (first (t/name task))]
       (or (= type :combine)
           (= type :reduce)))))
+
+(defn actual-workers
+  "Returns a collection of all tasks which are actual workers for this
+  particular chunk in a given task. Traverses split/join dependencies."
+  [task]
+  (if (nil? task)
+    #{}
+    (let [type (first (t/name task))]
+      (case type
+        (:combine :reduce) #{task}
+        (:split-combine :split-reduce :join-combine :join-reduce)
+        (into #{} (mapcat actual-workers (t/task-deps task)))))))
 
 (defn join-concurrent-pass-result*
   "Checks to see if a concurrent pass join is OK, with early return"
@@ -295,7 +361,7 @@
 
         ; Let's look at reducers
         _ (doseq [i (range n)]
-            (let [; Original old reduce task which we're GUARANTEED to have
+            (let [; Original old reduce task. Might be missing by now!
                   old-rt0  (nth old-reduce-tasks0 i)
                   ; Old reduce task if present in result state
                   old-rt   (nth old-reduce-tasks i)
@@ -303,67 +369,70 @@
                   rt       (nth reduce-tasks i)
                   ; New reduce task, if present
                   new-rt   (nth new-reduce-tasks i)
-                  ; Which of these could possibly execute and do work?
-                  runnable? (fn [task]
-                              (and (worker? task)
-                                   (could-run? state' task)))
-                  _ (if (runnable? rt)
-                      (when (or (runnable? old-rt0)
-                                (runnable? old-rt)
-                                (runnable? new-rt))
-                        (return! (err [:duplicate-reduces i]
-                                      {:old0 (runnable? old-rt0)
-                                       :old  (runnable? old-rt)
-                                       :fused (runnable? rt)
-                                       :new  (runnable? new-rt)})))
-                      ; Separate reducers
-                      (when-not (and (or (runnable? old-rt0)
-                                         (runnable? old-rt))
-                                     (runnable? new-rt))
-                        (return! (err [:missing-reduces i]
-                                      {:old0 (runnable? old-rt0)
-                                       :old  (runnable? old-rt)
-                                       :fused (runnable? rt)
-                                       :new  (runnable? new-rt)}))))
-                  ; We don't want to duplicate work on the old reducer.
-                  _ (when-not (= old-rt0 old-rt)
-                      (when (and (runnable? old-rt0) (runnable? old-rt))
-                        (return! (err [:duplicate-old-reduces i]
-                                      {:old0 (runnable? old-rt0)
-                                       :old  (runnable? old-rt)}))))
-
-                  ; OK, let's look at combiners
+                  ; Ditto, combiners
                   old-ct0 (nth old-combine-tasks0 i)
                   old-ct  (nth old-combine-tasks i)
                   ct      (nth combine-tasks i)
                   new-ct  (nth new-combine-tasks i)
+                  ; Does a task have any side effects besides the given tasks?
+                  effects? (fn effects?
+                             ([task] (effects? task #{}))
+                             ([task besides]
+                              (->> (actual-workers task)
+                                   (remove besides)
+                                   (filter (partial could-run? state'))
+                                   seq)))
+                  _ (if (and (worker? rt) (could-run? state' rt))
+                      ; We have an actual worker for the new reduce task. Old
+                      ; and new reduce tasks must be side-effect free (besides
+                      ; our own worker)
+                      (when (or (effects? old-rt0 #{rt})
+                                (effects? old-rt #{rt})
+                                (effects? new-rt #{rt}))
+                        (return! (err [:duplicate-reduces i]
+                                      {:old0 {:ran?      (t/ran? old-rt0)
+                                              :effects? (effects? old-rt0)}
+                                       :old  (effects? old-rt)
+                                       :fused (effects? rt)
+                                       :new  (effects? new-rt)})))
+                      ; We need a new reducer. Old reducer could be completely
+                      ; gone by this point, so we don't require it.
+                      (when-not (effects? new-rt #{rt})
+                        (return! (err [:missing-new-reduce i]
+                                       {:new  (effects? new-rt)}))))
+                  ; We don't want to duplicate work on the old reducer.
+                  _ (when-not (= old-rt0 old-rt)
+                      (when (and (effects? old-rt0) (effects? old-rt))
+                        (return! (err [:duplicate-old-reduces i]
+                                      {:old0 (effects? old-rt0)
+                                       :old  (effects? old-rt)}))))
 
-                  _ (if (runnable? ct)
-                      ; Doing a fused combine
-                      (when (or (runnable? old-ct0)
-                                (runnable? old-ct)
-                                (runnable? new-ct))
+                  ; OK, let's look at combiners
+                  _ (if (and (worker? ct) (could-run? state' ct))
+                      ; Doing a fused combine. Should be no effects (other than
+                      ; our fused combine itself) for old/new tasks.
+                      (when (or (effects? old-ct0 #{ct})
+                                (effects? old-ct #{ct})
+                                (effects? new-ct #{ct}))
                         (return! (err [:duplicate-combines i]
-                                      {:old0 (runnable? old-ct0)
-                                       :old  (runnable? old-ct)
-                                       :fused (runnable? ct)
-                                       :new  (runnable? new-ct)})))
-                      ; Separate reducers
-                      (when-not (and (or (runnable? old-ct0)
-                                         (runnable? old-ct))
-                                     (runnable? new-ct))
+                                      {:old0 (effects? old-ct0)
+                                       :old  (effects? old-ct)
+                                       :fused (effects? ct)
+                                       :new  (effects? new-ct)})))
+                      ; Not doing a fused combine. We need at least a new
+                      ; combiner; old one might be unknown.
+                      (when-not (effects? new-ct #{ct})
                         (return! (err [:missing-combines i]
-                                      {:old0 (runnable? old-ct0)
-                                       :old  (runnable? old-ct)
-                                       :fused (runnable? ct)
-                                       :new  (runnable? new-ct)}))))
+                                      {:old0 (effects? old-ct0)
+                                       :old  (effects? old-ct)
+                                       :fused (effects? ct)
+                                       :new  (effects? new-ct)}))))
                   ; We don't want to duplicate work on the old combiner
                   _ (when-not (= old-ct0 old-ct)
-                      (when (and (runnable? old-ct0) (runnable? old-ct))
+                      (when (and (effects? old-ct0) (effects? old-ct))
                         (return! (err [:duplicate-old-combines i]
-                                      {:old0 (runnable? old-ct0)
-                                       :old  (runnable? old-ct)}))))
-
+                                      {:old0 (effects? old-ct0)
+                                       :old  (effects? old-ct)}))))
 
                   ]))
         ]
@@ -371,57 +440,61 @@
 
 (defn join-concurrent-pass-result
   "Checks to see if a concurrent pass join is OK."
-  [chunks state0 state state' old-pass new-pass pass]
+  [{:keys [chunks state0 state state' old-pass new-pass pass]}]
   ; Mechanics for early return; this code is a BEAR to write functionally
   (let [return! (fn [x]
                   (throw (ex-info nil {:type :early-return
-                                       :return x})))]
-    (try
-      (join-concurrent-pass-result* chunks state0 state state'
-                                    old-pass new-pass pass return!)
-      (catch clojure.lang.ExceptionInfo e
-        (if (= :early-return (:type (ex-data e)))
-          (:return (ex-data e))
-          (throw e))))))
+                                       :return x})))
+        res (try
+              (join-concurrent-pass-result* chunks state0 state state'
+                                            old-pass new-pass pass return!)
+              (catch clojure.lang.ExceptionInfo e
+                (if (= :early-return (:type (ex-data e)))
+                  (:return (ex-data e))
+                  (throw e))))]
+    (reify Result
+      (pass? [_] (results/pass? res))
+      (result-data [_]
+        (assoc (results/result-data res)
+               :chunk-count (count chunks)
+               :state  state
+               :state' state'
+               ; The folds are huge and not important
+               :old-pass (dissoc old-pass :fold :deliver)
+               :new-pass (dissoc new-pass :fold :deliver)
+               :pass     (dissoc pass :fold :deliver)
+               :print    (fn []
+                           (println
+                             (f/print-join-plan
+                               state' old-pass new-pass pass))))))))
 
 ; We try to verify that concurrent pass join plans, you know, make *sense*
-(defspec ^:focus join-concurrent-pass-spec {:num-tests n
-                                            ;:seed 1666379400858
-                                            }
-  (prop/for-all [{:keys [chunks old-pass new-pass state0 state]}
-                 (gen/let [chunks (gen/not-empty
-                                    ; No real diff between 5 chunks and 50
-                                    (gen/scale (fn [size]
-                                                 (inc (/ size chunk-scale 2)))
-                                               (gen/vector (gen/return []))))
-                           new-pass         (concurrent-pass-gen chunks)
-                           [state0 state old-pass] (running-concurrent-pass-gen
-                                                     chunks)]
-                           {:chunks   chunks
-                            :state0   state0
-                            :state    state
-                            :old-pass old-pass
-                            :new-pass new-pass})]
-                (let [[state' pass]
-                      (f/join-concurrent-pass state old-pass new-pass)
-                      r (join-concurrent-pass-result
-                          chunks state0 state state' old-pass new-pass pass)]
-                  ; Wrap result with more data
-                  (reify Result
-                    (pass? [_] (results/pass? r))
-                    (result-data [_]
-                      (assoc (results/result-data r)
-                             :chunk-count (count chunks)
-                             :state  state
-                             :state' state'
-                             ; The folds are huge and not important
-                             :old-pass (dissoc old-pass :fold :deliver)
-                             :new-pass (dissoc new-pass :fold :deliver)
-                             :pass     (dissoc pass :fold :deliver)
-                             :print    (fn []
-                                         (println
-                                         (f/print-join-plan
-                                           state' old-pass new-pass pass)))))))))
+;
+; Cheat sheet for REPL work here:
+#_ (do
+    (require '[clojure.test.check [generators :as gen] [results :as res]])
+    (require '[jepsen.history [fold-test :as ft] [fold :as fold] [task :as t]] :reload)
+    ; Run test
+    (def qc (ft/join-concurrent-passes-spec))
+    ; See error
+    (-> qc :shrunk :result-data pprint)
+    ; Print final plan
+    (-> qc :shrunk :result-data :print (apply []))
+    ; See input that failed
+    (-> qc :shrunk :smallest first)
+    ; Re-run failing case by hand
+    (-> qc :shrunk :smallest first ft/join-concurrent-passes)
+    ; Re-run with analysis
+    (-> qc :shrunk :smallest first ft/join-concurrent-passes last ft/join-concurrent-pass-result res/pass?)
+    (-> qc :shrunk :smallest first ft/join-concurrent-passes last ft/join-concurrent-pass-result res/result-data pprint)
+    )
+
+(defspec join-concurrent-passes-spec {:num-tests n
+                                      ;:seed 1666379400858
+                                      }
+  (prop/for-all [inputs join-concurrent-passes-inputs-gen]
+                (let [steps (join-concurrent-passes inputs)]
+                  (all-results (map join-concurrent-pass-result steps)))))
 
 (defn apply-fold-with-reduce
   "Applies a fold naively using reduce"
@@ -446,7 +519,6 @@
                   (binding [;*out* stdout
                             ;*err* stdout
                             ]
-                    ;(prn :active (Thread/activeCount))
                     (let [executor   (f/executor (hc/chunked chunk-size dogs))
                           model-res  ((:model fold) dogs)
                           reduce-res (apply-fold-with-reduce fold dogs)
@@ -477,7 +549,7 @@
          :reduce reduce-res
          :exec   exec-res}))))
 
-(defspec fold-equiv-parallel n
+(defspec ^:focus fold-equiv-parallel n
   (prop/for-all [dogs       dogs-gen
                  chunk-size small-pos-int
                  ; folds    (gen/vector (slow-fold-gen basic-fold-gen))

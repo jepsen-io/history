@@ -133,6 +133,11 @@
   [^Task t]
   (.name t))
 
+(defn ran?
+  "Returns true iff a task ran already."
+  [^Task t]
+  (realized? (.output t)))
+
 ; An immutable representation of our executor state. By happy circumstance, it
 ; is *also* an immutable representation of a queue, which the executor can pull
 ; work from.
@@ -231,6 +236,9 @@
   integrated, including a [:new-task task], which you can use to read the
   created task.
 
+  Dependencies must either be in the graph already, or realized, to prevent
+  deadlock.
+
   If the task has no dependencies, it may be ready immediately; the :new-task
   effect will be followed by a [:ready-task task] effect. In either case, the
   final effect *will* contain the newly created task."
@@ -253,7 +261,14 @@
                    ; graph if they're already finished
                    (if (.contains (.vertices g) dep)
                      (recur (.link g dep task))
-                     (recur g)))
+                     ; Oh hang on, you're trying to add something that we don't
+                     ; have. Is it finished?
+                     (do (assert+ (realized? (.output dep))
+                                  IllegalStateException
+                                  (str "Task " (pr-str task) " dependency "
+                                       (pr-str dep)
+                                       " is unknown and has not finished. This could cause deadlock!"))
+                         (recur g))))
                (.forked g))
         ; Is the task ready now?
         ready? (= 0 (.size ^ISet (.in dep-graph' task)))
@@ -349,6 +364,7 @@
   tasks you might like to cancel. Cancels all tasks not contributing to the
   goal, returning a new state."
   [^State state, goal, to-delete]
+  ;(info "GC targets" to-delete)
   (let [^DirectedGraph dep-graph (.dep-graph state)
         deps (reify Function
                (apply [_ task]
@@ -361,7 +377,7 @@
         to-delete (loopr [to-delete (.linear (Set/from to-delete))]
                          [t (Graphs/bfsVertices ^Iterable goal deps)]
                          (recur (.remove to-delete t)))]
-    (info "GCing" (.size to-delete) "unneeded tasks")
+    (info "GCing" (.size to-delete) "unneeded tasks:" to-delete)
     (reduce cancel-task state to-delete)))
 
 (defn state-queue-claim-task*!
