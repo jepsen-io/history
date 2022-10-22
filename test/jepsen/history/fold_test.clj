@@ -166,6 +166,10 @@
   (gen/let [pass (concurrent-pass-gen chunks)]
     (f/launch-concurrent-pass state pass)))
 
+(def chunk-scale
+  "A scaling parameter for number of chunks in concurrent-pass-join tests"
+  25)
+
 (defn running-concurrent-pass-gen
   "A generator of a running concurrent pass on a fresh state, which returns
   [state0 state' pass]. State0 is the state with all tasks still registered, so
@@ -173,7 +177,10 @@
   tasks will have started."
   [chunks]
   (gen/let [[state0 pass] (launch-concurrent-pass-gen (t/state) chunks)
-            ops          (gen/vector (gen/elements [:run :finish]))]
+            ops           (gen/scale (fn [size]
+                                       (inc (/ size chunk-scale)))
+                                     (gen/vector
+                                       (gen/elements [:run :finish])))]
     ; Run some of the tasks
     (let [; Side effect channel for pulling tasks off state
           last-task (volatile! nil)]
@@ -228,18 +235,32 @@
     (result-data [_]
       (results/result-data (first (remove results/pass? results))))))
 
-(defn will-complete?
+(defn ran?
+  "Did a task already run?"
+  [^jepsen.history.task.Task task]
+  (realized? (.output task)))
+
+(defn will-run?
   "Will a task eventually complete? Either it already ran, or its in the state,
   *and* all its deps will complete."
-  [state ^jepsen.history.task.Task task]
-  (when-not (or (realized? (.output task))
-                (t/has-task? state task))
-    (info :task task :realized? (realized? (.output task))
-          :has-task? (t/has-task? state task)
-          "\n" (with-out-str (pprint state))))
-  (or (realized? (.output task))
+  [state task]
+  (or (ran? task)
       (and (t/has-task? state task)
-           (every? (partial will-complete? state) (t/task-deps task)))))
+           (every? (partial will-run? state) (t/task-deps task)))))
+
+(defn could-run?
+  "Either it already ran or it's in the state."
+  [state task]
+  (or (ran? task)
+      (t/has-task? state task)))
+
+(defn worker?
+  "Is a task actually going to do work, or is it just a split/join?"
+  [task]
+  (when task
+    (let [type (first (t/name task))]
+      (or (= type :combine)
+          (= type :reduce)))))
 
 (defn join-concurrent-pass-result*
   "Checks to see if a concurrent pass join is OK, with early return"
@@ -265,7 +286,7 @@
             (return! (err :no-final-combine combine-tasks)))
 
         ; Which must complete in the new state
-        _ (when-not (will-complete? state' (peek combine-tasks))
+        _ (when-not (will-run? state' (peek combine-tasks))
             (return! (err :won't-complete (peek combine-tasks))))
 
         ; If you gave up, fine
@@ -274,24 +295,75 @@
 
         ; Let's look at reducers
         _ (doseq [i (range n)]
-            (let [old-rt0  (nth old-reduce-tasks0 i)
+            (let [; Original old reduce task which we're GUARANTEED to have
+                  old-rt0  (nth old-reduce-tasks0 i)
+                  ; Old reduce task if present in result state
                   old-rt   (nth old-reduce-tasks i)
+                  ; Fused reduce task, if present
                   rt       (nth reduce-tasks i)
+                  ; New reduce task, if present
                   new-rt   (nth new-reduce-tasks i)
-                  ; If you do a fused reduce task, the original worker should
-                  ; be cancelled.
-                  _ (when (and rt (= :reduce (first (t/name rt))))
-                      (when-not (t/pending? state old-rt0)
-                        (return! (err [:old-rt-not-pending i]
-                                      {:old-rt old-rt0})))
-                      (when (t/has-task? state' old-rt0)
-                        (return! (err [:old-rt-still-scheduled i]
-                                     {:old-rt old-rt0})))
-                      ; We're allowed to have an old reduce task but it has to
-                      ; be a split.
-                      (when (and old-rt (= :reduce (first (t/name old-rt))))
-                        (return! (err :old-rt-wrong-type :nil-or-join-reduce
-                                     (t/name old-rt)))))
+                  ; Which of these could possibly execute and do work?
+                  runnable? (fn [task]
+                              (and (worker? task)
+                                   (could-run? state' task)))
+                  _ (if (runnable? rt)
+                      (when (or (runnable? old-rt0)
+                                (runnable? old-rt)
+                                (runnable? new-rt))
+                        (return! (err [:duplicate-reduces i]
+                                      {:old0 (runnable? old-rt0)
+                                       :old  (runnable? old-rt)
+                                       :fused (runnable? rt)
+                                       :new  (runnable? new-rt)})))
+                      ; Separate reducers
+                      (when-not (and (or (runnable? old-rt0)
+                                         (runnable? old-rt))
+                                     (runnable? new-rt))
+                        (return! (err [:missing-reduces i]
+                                      {:old0 (runnable? old-rt0)
+                                       :old  (runnable? old-rt)
+                                       :fused (runnable? rt)
+                                       :new  (runnable? new-rt)}))))
+                  ; We don't want to duplicate work on the old reducer.
+                  _ (when-not (= old-rt0 old-rt)
+                      (when (and (runnable? old-rt0) (runnable? old-rt))
+                        (return! (err [:duplicate-old-reduces i]
+                                      {:old0 (runnable? old-rt0)
+                                       :old  (runnable? old-rt)}))))
+
+                  ; OK, let's look at combiners
+                  old-ct0 (nth old-combine-tasks0 i)
+                  old-ct  (nth old-combine-tasks i)
+                  ct      (nth combine-tasks i)
+                  new-ct  (nth new-combine-tasks i)
+
+                  _ (if (runnable? ct)
+                      ; Doing a fused combine
+                      (when (or (runnable? old-ct0)
+                                (runnable? old-ct)
+                                (runnable? new-ct))
+                        (return! (err [:duplicate-combines i]
+                                      {:old0 (runnable? old-ct0)
+                                       :old  (runnable? old-ct)
+                                       :fused (runnable? ct)
+                                       :new  (runnable? new-ct)})))
+                      ; Separate reducers
+                      (when-not (and (or (runnable? old-ct0)
+                                         (runnable? old-ct))
+                                     (runnable? new-ct))
+                        (return! (err [:missing-combines i]
+                                      {:old0 (runnable? old-ct0)
+                                       :old  (runnable? old-ct)
+                                       :fused (runnable? ct)
+                                       :new  (runnable? new-ct)}))))
+                  ; We don't want to duplicate work on the old combiner
+                  _ (when-not (= old-ct0 old-ct)
+                      (when (and (runnable? old-ct0) (runnable? old-ct))
+                        (return! (err [:duplicate-old-combines i]
+                                      {:old0 (runnable? old-ct0)
+                                       :old  (runnable? old-ct)}))))
+
 
                   ]))
         ]
@@ -314,14 +386,13 @@
 
 ; We try to verify that concurrent pass join plans, you know, make *sense*
 (defspec ^:focus join-concurrent-pass-spec {:num-tests n
-                                            :seed 1666379400858}
+                                            ;:seed 1666379400858
+                                            }
   (prop/for-all [{:keys [chunks old-pass new-pass state0 state]}
                  (gen/let [chunks (gen/not-empty
                                     ; No real diff between 5 chunks and 50
                                     (gen/scale (fn [size]
-                                                 (if (< size 10)
-                                                   size
-                                                   (/ size 10)))
+                                                 (inc (/ size chunk-scale 2)))
                                                (gen/vector (gen/return []))))
                            new-pass         (concurrent-pass-gen chunks)
                            [state0 state old-pass] (running-concurrent-pass-gen

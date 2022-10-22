@@ -622,10 +622,20 @@
                                     ; from "none missing"
                                     -2
                                     (recur (dec i)))))
+        last-missing-combine-i (loop [i (dec n)]
+                                 (if-not (aget old-combine-tasks i)
+                                   i
+                                   (if (= i 0)
+                                     ; Some of our comparisons are simpler if we
+                                     ; can safely distinguish "first missing"
+                                     ; from "none missing"
+                                     -2
+                                     (recur (dec i)))))
+        last-missing-i (min last-missing-reduce-i last-missing-combine-i)
         _ (loop [i 0]
             (when (< i n)
               (let [old-rt (aget old-reduce-tasks i)]
-                (if (and (< last-missing-reduce-i (dec i))
+                (if (and (< last-missing-i (dec i))
                          (reduce-task-work-pending? state old-rt))
                   (do ; Replace with a fused reduce
                       (cancel! old-rt)
@@ -638,11 +648,11 @@
                             (task! make-reduce-task new-fold chunks i))))
                 (recur (inc i)))))
 
-        _ (info (str "New reduce plan:\n"
-                     (print-join-plan n @vstate
-                                      old-reduce-tasks old-combine-tasks
-                                      reduce-tasks combine-tasks
-                                      new-reduce-tasks new-combine-tasks)))
+        ;_ (info (str "New reduce plan:\n"
+        ;             (print-join-plan n @vstate
+        ;                              old-reduce-tasks old-combine-tasks
+        ;                              reduce-tasks combine-tasks
+        ;                              new-reduce-tasks new-combine-tasks)))
 
         ; Looks up the old combine task at i, or creates a split from the
         ; existing fused combine tasks.
@@ -710,8 +720,8 @@
         fused-combine-possible?
         (fn fused-combine-possible? [i]
           (and ; We can't start fusing combines until we get past missing
-               ; reducers.
-               (< last-missing-reduce-i i)
+               ; reducers/combiners.
+               (< last-missing-i i)
                ; We need the previous combine task, or both previous old
                ; and new combine tasks.
                (or (= 0 i)
@@ -770,11 +780,11 @@
         ; *previous* chunk.
         _ (loop [i 1]
             (when (< i n)
-              _ (info (str "Combine plan up to i = " i "\n"
-                           (print-join-plan n @vstate
-                                            old-reduce-tasks old-combine-tasks
-                                            reduce-tasks combine-tasks
-                                            new-reduce-tasks new-combine-tasks)))
+              ;_ (info (str "Combine plan up to i = " i "\n"
+              ;             (print-join-plan n @vstate
+              ;                              old-reduce-tasks old-combine-tasks
+              ;                              reduce-tasks combine-tasks
+              ;                              new-reduce-tasks new-combine-tasks)))
               (let [old-ct (aget old-combine-tasks i)]
                 (if (combine-task-work-pending? state old-ct)
                   ; We can cancel the old combine, if we can make a fused one.
@@ -782,7 +792,7 @@
                     ; We have enough information to do a fused combine here.
                     (let [prev-ct (assert+ (combine-task! (dec i)))
                           rt      (assert+ (reduce-task! i))]
-                      (info "Replacing old combine with fused combine")
+                      ; (info "Replacing old combine with fused combine")
                       (cancel! old-ct)
                       (aset old-combine-tasks i nil)
                       (aset combine-tasks i
@@ -792,20 +802,9 @@
                     ; combine task though. Can we replace it?
                     (if (old-combine-computable? i)
                       ; We can compute an old combine task! Gotta do new too.
-                      (let [_           (info :i i
-                                              :last-missing
-                                              last-missing-reduce-i
-                                              :fused-combine-possible?
-                                              (fused-combine-possible? i)
-                                              :prev-combine
-                                              (aget combine-tasks (dec i))
-                                              :current-red
-                                              (aget reduce-tasks i))
-
-
-                            prev-old-ct (old-combine-task! (dec i))
+                      (let [prev-old-ct (old-combine-task! (dec i))
                             old-rt      (old-reduce-task! i)]
-                        (info "Replacing old combine task")
+                        ;(info "Replacing old combine task")
                         (cancel! old-ct)
                         (aset old-combine-tasks i
                               (task! make-combine-task old-fold chunks i
@@ -818,16 +817,16 @@
                       (do ; Can't compute an old combine task--maybe it's
                           ; already completed. We have to do a new combine
                           ; here.
-                          (info "Can't compute old combine task; just doing new")
+                          ;(info "Can't compute old combine task; just doing new")
                           (aset new-combine-tasks i
                                 (task! make-combine-task new-fold chunks i
                                        (assert+ (new-combine-task! (dec i)))
                                        (assert+ (new-reduce-task! i)))))))
                   (do ; Can't cancel old combine.
-                      (info "Can't cancel old combine, just doing new.")
-                      (info :work-pending? (combine-task-work-pending? state old-ct))
-                      (info :old-ct old-ct)
-                      (info :state (with-out-str (pprint state)))
+                      ;(info "Can't cancel old combine, just doing new.")
+                      ;(info :work-pending? (combine-task-work-pending? state old-ct))
+                      ;(info :old-ct old-ct)
+                      ;(info :state (with-out-str (pprint state)))
                       (aset new-combine-tasks i
                             (task! make-combine-task new-fold chunks i
                                    (assert+ (new-combine-task! (dec i)))
@@ -838,12 +837,12 @@
         combine-task (combine-task! (dec n))
       ]
 
-    (info (str "Combine plan:\n"
-               (print-join-plan n @vstate
-                                old-reduce-tasks old-combine-tasks
-                                reduce-tasks combine-tasks
-                                new-reduce-tasks new-combine-tasks)))
-    (info "Last missing reduce" last-missing-reduce-i)
+    ;(info (str "Combine plan:\n"
+    ;           (print-join-plan n @vstate
+    ;                            old-reduce-tasks old-combine-tasks
+    ;                            reduce-tasks combine-tasks
+    ;                            new-reduce-tasks new-combine-tasks)))
+    ;(info "Last missing reduce" last-missing-reduce-i)
     ; We could have gotten something completely unmergeable. If the last
     ; reducer is missing, we can't optimize a thing.
     (if (= (dec n) last-missing-reduce-i)
