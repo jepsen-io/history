@@ -41,7 +41,9 @@
    ^long id
    ; A friendly name for this task
    name
-   ; A collection of tasks we depend on
+   ; A collection of tasks we depend on. TODO: retaining the outputs of these
+   ; tasks forever means we retain EVERY task in a chain until the final task
+   ; is done.
    deps
    ; A function which takes a map of task IDs (our dependencies) to their
    ; results, and produces a result
@@ -117,6 +119,15 @@
   [^Task t]
   (.deps t))
 
+(defn all-task-deps
+  "Returns an iterable of all deps of a task."
+  [^Task task]
+  (let [deps (reify Function
+               (apply [_ task]
+                 (or (task-deps task)
+                     [])))]
+    (Graphs/bfsVertices task deps)))
+
 (defn name
   "Returns the name of a task."
   [^Task t]
@@ -171,6 +182,11 @@
                                   (Task. task-id nil nil nil nil nil))]
     (when (.isPresent i)
       (.nth dep-graph (.getAsLong i)))))
+
+(defn has-task?
+  "Takes a state and a task. Returns true iff the state knows about this task."
+  [^State state, task]
+  (.contains (.vertices (.dep-graph state)) task))
 
 (defn pending?
   "Takes a state and a task. Returns true iff that task is still pending
