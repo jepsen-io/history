@@ -656,7 +656,9 @@
         ; We need to cancel the old deliver task if we're going to preserve
         ; exactly-once execution. Should do early return here later--maybe
         ; split up fn?
-        _ (when old-deliver-task (cancel! old-deliver-task))
+        _ (when old-deliver-task
+            (info "Cancel delivery task" old-deliver-task)
+            (cancel! old-deliver-task))
 
         _ (info (str "Original folds:\n"
                      (print-join-plan n @vstate
@@ -889,12 +891,17 @@
             ; The deliver fn takes post-combined results, which means a pair
             ; of [old-result new-result]
             deliver-fn (fn deliver-acc [[old-res new-res]]
-                         ;(info :joint-delivery old-res new-res)
+                         (info :joint-delivery (:name fused)
+                               old-res new-res)
+                         (info :old-deliver old-deliver)
                          (old-deliver old-res)
-                         (new-deliver new-res))
+                         (info :new-deliver new-deliver)
+                         (new-deliver new-res)
+                         (info :joint-delivery-complete (:name fused)))
             state' @vstate
             [state' deliver-task]
             (make-deliver-task state' fused combine-task deliver-fn)
+            _ (info :new-delivery-task deliver-task)
 
             ; Right, now we go back and garbage collect every task *not*
             ; involved in producing our output. Should be able to drop this now
@@ -1059,8 +1066,11 @@
         chunks     (hc/chunks history)
         result     (promise)
         deliver-fn (fn [r]
+                     (info :single-delivery (:name fold) r)
                      (deliver result r)
-                     (clear-old-passes! e))
+                     ; TODO: make this async (use task executor!)
+                     ;(clear-old-passes! e)
+                     )
         new-pass   (concurrent-pass chunks fold deliver-fn)
         resulting-pass (atom nil)]
     ; We're about to go do some VERY heavy computation on the executor, and
