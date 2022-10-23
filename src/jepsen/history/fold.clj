@@ -316,14 +316,14 @@
   "Takes a task executor state, a fold, chunks, a chunk index. Returns
   [state' task]: a new task to reduce that chunk."
   [state {:keys [reducer-identity, reducer, post-reducer]} chunks i]
-  (task/new-task+ state
-                  [:reduce i]
-                  nil
-                  (fn task [_]
-                    (post-reducer
-                      (reduce reducer
-                              (reducer-identity)
-                              (nth chunks i))))))
+  (task/submit state
+               [:reduce i]
+               nil
+               (fn task [_]
+                 (post-reducer
+                   (reduce reducer
+                           (reducer-identity)
+                           (nth chunks i))))))
 
 (defn make-combine-task
   "Takes a task executor state, a fold, chunks, a chunk index, and either:
@@ -336,34 +336,34 @@
   ([state {:keys [combiner-identity combiner]}
     chunks i reduce-task]
    (let [n (count chunks)]
-     (task/new-task+ state
-                     [:combine i]
-                     [reduce-task]
-                     (fn first-task [inputs]
-                       (let [res (combiner (combiner-identity) @reduce-task)]
-                         ;(info :combine i res)
-                         res)))))
+     (task/submit state
+                  [:combine i]
+                  [reduce-task]
+                  (fn first-task [inputs]
+                    (let [res (combiner (combiner-identity) @reduce-task)]
+                      ;(info :combine i res)
+                      res)))))
   ([state {:keys [combiner post-combiner]}
     chunks i prev-combine-task reduce-task]
    (let [n (count chunks)]
-     (task/new-task+ state
-                     [:combine i]
-                     [reduce-task prev-combine-task]
-                     (fn task [_]
-                       (let [res (combiner @prev-combine-task @reduce-task)]
-                         ;(info :combine i res)
-                         res))))))
+     (task/submit state
+                  [:combine i]
+                  [reduce-task prev-combine-task]
+                  (fn task [_]
+                    (let [res (combiner @prev-combine-task @reduce-task)]
+                      ;(info :combine i res)
+                      res))))))
 
 (defn make-deliver-task
   "Takes a task executor state, a final combine task, and a function which
   delivers results to the output of a fold. Returns [state' task], where task
   applies the post-combiner of the fold and calls deliver-fn with the results"
   [state {:keys [post-combiner]} task deliver-fn]
-  (task/new-task+ state
-                  [:deliver]
-                  [task]
-                  (fn deliver [_]
-                    (deliver-fn (post-combiner @task)))))
+  (task/submit state
+               [:deliver]
+               [task]
+               (fn deliver [_]
+                 (deliver-fn (post-combiner @task)))))
 
 (defn make-split-task
   "Takes a task executor state, a name, a function that splits an accumulator,
@@ -371,25 +371,25 @@
   accumulator. Returns [state' task], where task returns the given index in the
   accumulator task."
   [state name split-accs i acc-task]
-  (task/new-task+ state
-                  name
-                  [acc-task]
-                  (fn split [_]
-                    (nth (split-accs @acc-task) i))))
+  (task/submit state
+               name
+               [acc-task]
+               (fn split [_]
+                 (nth (split-accs @acc-task) i))))
 
 (defn make-join-task
   "Takes a task executor state, a name, a function that joins two accumulator,
   and accumulator tasks a and b. Returns [state' task], where task returns the
   two accumulators joined."
   [state name join-accs a-task b-task]
-  (task/new-task+ state
-                  name
-                  [a-task b-task]
-                  (fn join [_]
-                    ; TODO: all of these retain memory by retaining refs to
-                    ; prior tasks--if we figure out how not to do that, replace
-                    ; this with task IDs and getting from fn inputs.
-                    (join-accs @a-task @b-task))))
+  (task/submit state
+               name
+               [a-task b-task]
+               (fn join [_]
+                 ; TODO: all of these retain memory by retaining refs to
+                 ; prior tasks--if we figure out how not to do that, replace
+                 ; this with task IDs and getting from fn inputs.
+                 (join-accs @a-task @b-task))))
 
 (defn reduce-task-work-pending?
   "We may have a join task which unifies work from two different reducers. If
@@ -404,7 +404,7 @@
                (:reduce (first (task/name task)))
                ; We're a join task
                (every? (partial reduce-task-work-pending? state)
-                       (task/task-deps task))))))
+                       (task/deps task))))))
 
 (defn combine-task-work-pending?
   "We may have a combine task which joins work from multiple combine tasks. If
@@ -421,7 +421,7 @@
                (= :combine (first (task/name task)))
                ; We're a join task
                (every? (partial combine-task-work-pending? state)
-                       (task/task-deps task))))))
+                       (task/deps task))))))
 
 (defn cancel-task-work-for-chunk
   "Takes a state and a reduce, combine, split, or join task. Cancels not only
@@ -434,10 +434,10 @@
     state
     (case (first (task/name task))
       (:reduce, :combine, :deliver)
-      (task/cancel-task state task)
+      (task/cancel state task)
 
       (:split-reduce, :split-combine, :join-reduce, :join-combine)
-      (reduce cancel-task-work-for-chunk state (task/task-deps task)))))
+      (reduce cancel-task-work-for-chunk state (task/deps task)))))
 
 ; Pass construction
 (defn concurrent-pass

@@ -7,6 +7,8 @@ pom.xml.asc
 *.jar
 *.class
 *.swp
+*.hprof
+/dogs
 /.lein-*
 /.nrepl-port
 /.prepl-port

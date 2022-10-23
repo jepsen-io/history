@@ -240,7 +240,7 @@
                     ; If it crashes, we want to blow up here!
                     (assert (realized? (.output task)))
                     @task
-                    (-> (t/finish-task state task)
+                    (-> (t/finish state task)
                         (assoc :effects (List.))))
                   ; Nothing running
                   state)))))
@@ -367,7 +367,7 @@
   [state task]
   (or (t/ran? task)
       (and (t/has-task? state task)
-           (every? (partial will-run? state) (t/task-deps task)))))
+           (every? (partial will-run? state) (t/deps task)))))
 
 (defn could-run?
   "Either it already ran or it's in the state."
@@ -393,7 +393,7 @@
       (case type
         (:combine :reduce) #{task}
         (:split-combine :split-reduce :join-combine :join-reduce)
-        (into #{} (mapcat actual-workers (t/task-deps task)))))))
+        (into #{} (mapcat actual-workers (t/deps task)))))))
 
 (defn join-concurrent-pass-result*
   "Checks to see if a concurrent pass join is OK, with early return"
@@ -698,7 +698,7 @@
 
 
 ; This one's *just* for perf testing. Spews JSON to a file then folds over it as if it were tons of files.
-(deftest ^:perf ^:focus fold-parallel-perf
+(deftest ^:perf fold-parallel-perf
   ; a billion dogs might be enough -- nona, probably
   (let [dog-count   1e7
         chunk-count 100

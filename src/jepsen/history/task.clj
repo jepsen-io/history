@@ -1,7 +1,121 @@
 (ns jepsen.history.task
-  "Supports jepsen.history.dataflow by providing a low-level executor for tasks
-  with dependencies. Handles threadpool management, wraps queue operations,
-  etc."
+  "A transactional, dependency-graph oriented task scheduler. Provides a
+  stateful executor for CPU-bound tasks backed by a num-cores
+  ThreadPoolExecutor, and allows you to submit tasks to be run on that
+  executor.
+
+    (require '[jepsen.history.task :as task])
+    (def e (task/executor))
+
+  At a very high level, a task is a named function of optional dependencies
+  (inputs) which returns an output. Here's a task with no dependencies:
+
+    (def pet (task/submit! e :pet-dog (fn [_] :petting-dog)))
+
+  Tasks are de-refable with the standard blocking and nonblocking calls.
+  Derefing a task returns its output. You can ask completion with `realized?`
+
+    @pet             ; :petting-dog
+    (realized? pet)  ; true
+
+  If a task throws, its output is the Throwable it threw. Derefing that
+  throwable also throws, like Clojure futures. Exceptions propagate to
+  dependencies: dependencies will never execute, and if derefed, will throw as
+  well.
+
+    (def doomed (task/submit! e :doomed (fn [_] (assert false))))
+    ; All fine, until
+    @doomed    ; throws Assert failed: false
+
+  Each task is assigned a unique long ID by its executor. Tasks should never be
+  used across executors; their hashcodes and equality semantics are, for
+  performance reasons, by ID *alone*.
+
+    (task/id pet)   ; 0
+
+  Tasks also have names, which can be any non-nil object, and are used for
+  debugging & observability. Tasks can also carry an arbitrary data object,
+  which can be anything you like. You can use this to build more sophisticated
+  task management systems around this executor.
+
+    (task/name pet)   ; :pet-dog
+
+    (def train (task/submit! e :train {:tricks [:down-stay :recall]} nil
+                 (fn [_] :training-dog)))
+    (task/data train)  ; {:tricks [:down-stay :recall]}
+
+  When submitted, tasks can depend on earlier tasks. When it executes, a task
+  receives a vector of the outputs of its dependencies. A task only executes
+  once its dependencies have completed, and will observe their memory effects.
+
+    (def dog-promise (promise))
+    (def dog-task    (task/submit! e :make-dog    (fn [_] @dog-promise)))
+    (def person-task (task/submit! e :make-person (fn [_] :nona)))
+    (def adopt-task  (task/submit! e :adopt [person-task dog-task]
+                       (fn [[person dog]]
+                         (prn person :adopts dog)
+                         :adopted!)))
+    ; Adopt pauses, waiting on dog, which in turn is waiting on our
+    ; dog-promise.
+    (realized? adopt-task) ; false
+
+    (task/dep-ids adopt-task) ; [5 4]
+
+    ;Person completed immediately:
+    @person-task   ; :nona
+
+    ; Let's let the dog task run. Once it does, adopt can run too.
+    (deliver dog-promise :noodle)
+    ; Immediately prints :nona :adopts :noodle
+
+    ; Now we can deref the adoption task.
+    @adopt-task    ; :adopted!
+
+  Tasks may be cancelled. Cancelling a task also cancels all tasks which depend
+  on it. Unlike normal ThreadPoolExecutors, cancellation is *guaranteed* to be
+  safe: if a task is still pending, it will never run. Cancelling a task which
+  is running or has already run has no effect, other than removing it from the
+  executor state. This may not be right for all applications; it's important
+  for us.
+
+    (task/cancel! e adopt-task)
+
+  Tasks either run to completion or are cancelled; they are never interrupted.
+  If they are, who knows what could happen? Almost certainly the executor will
+  stall some tasks forever. Hopefully you're throwing away the executor and
+  moving on with your life.
+
+  Unlike standard j.u.c executors, tasks in this system may be created,
+  queried, and cancelled *transactionally*. The executor's state (`State`) is a
+  persistent, immutable structure. You perform a transaction with `(txn!
+  executor (fn [state] ...))`, which returns a new state. Any transformations
+  you apply to the state take place atomically. Note that these functions use
+  pure functions without `!`: `submit` instead of `submit!`, etc.
+
+    ; Create a task which blocks...
+    (def dog-promise (promise))
+    (def dog-task (task/submit! e :find-dog (fn [_] @dog-promise)))
+    ; And one that depends on it
+    (def adopt-task (task/submit! e :adopt-dog [dog-task]
+      (fn [dog] (println :adopting dog) [:adopted dog])))
+
+    ; adopt-task hasn't run because dog-task is still pending.
+    (task/txn! e (fn [state]
+      ; Make sure the adoption hasn't happened yet
+      (if-not (task/pending? state adopt-task)
+        state
+        ; If it hasn't happened yet, cancel the dog task. Adoption will be
+        ; cancelled automatically.
+        (let [state' (task/cancel state dog-task)
+              ; And do something else
+              [state' new-task] (task/submit state' :enter-tomb
+                                  (fn [_]
+                                    (prn :oh-no)
+                                    :tomb-entered))]
+          state'))))
+  ; prints :oh-no
+  (deliver dog-promise :noodle)
+  ; Adoption never happens!"
   (:refer-clojure :exclude [name])
   (:require [clojure [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn fatal]]
@@ -41,14 +155,17 @@
    ^long id
    ; A friendly name for this task
    name
-   ; A collection of tasks we depend on. TODO: retaining the outputs of these
-   ; tasks forever means we retain EVERY task in a chain until the final task
-   ; is done.
-   deps
+   ; Arbitrary metadata you might like to provide with a task
+   data
+   ; An array of task IDs we depend on
+   dep-ids
    ; A function which takes a map of task IDs (our dependencies) to their
    ; results, and produces a result
    f
-   ; The promise we should deliver our own result to.
+   ; An array of input promises from our dependencies. We clear this as soon as
+   ; the task begins to avoid retaining memory.
+   ^{:tag "[Ljava.lang.Object;", :unsynchronized-mutable true} inputs
+   ; The promise we should deliver our own result to
    ^IDeref output
    ; The executor we should update when we complete
    executor]
@@ -74,22 +191,35 @@
   Runnable
   (run [this]
        (try
-         (let [inputs (loopr [m (transient {})]
-                             [^Task task deps]
-                             (recur (assoc! m (.id task) @task))
-                             (persistent! m))]
-           (deliver output (f inputs)))
+         (let [n             (alength inputs)
+               input-results (object-array n)]
+           ; Fetch input results as an array.
+           (loop [i 0]
+             (when (< i n)
+               (let [res @(aget inputs i)]
+                 (when (instance? Throwable res)
+                   (throw res))
+                 (aset input-results i res))
+               (recur (unchecked-inc-int i))))
+           ; Immediately discard our input tasks so we don't retain memory.
+           ; Note that we have to be in a tail-position try block for this to
+           ; work.
+           (set! inputs nil)
+           ; Run function and deliver output
+           (let [out (f (vec input-results))]
+             (deliver output out)))
          ; TODO: sort out exactly what classes we should catch & propagate
          ; here. Java people love to do Weird Things in the exception
          ; hierarchy. Check real-pmap from dom-top?
          (catch Throwable t
-           (deliver output t)))
-       ; Inform executor we're done
-       (try
-         (when executor
-           (finish-task! executor this))
-         (catch Throwable t
-           (fatal t "Error finishing task!" this))))
+           (deliver output t))
+         (finally
+           ; Inform executor we're done
+           (try
+             (when executor
+               (finish-task! executor this))
+             (catch Throwable t
+               (fatal t "Error finishing task!" this))))))
 
   Object
   (hashCode [this]
@@ -102,6 +232,13 @@
 
   (toString [this]
     (str "(Task " name " " id ")")))
+
+(defn pseudotask
+  "One of the weird tricks we use (programmers HATE him!) is to abuse the
+  id-only equality semantics of Task objects for efficient lookups in our
+  internal graphs and sets. This constructs an empty task with the given ID."
+  [^long id]
+  (Task. id nil nil nil nil nil nil nil))
 
 ; pprint will try to block on the deref of tasks forever; makes it impossible
 ; to debug stuff
@@ -120,24 +257,20 @@
   [^Task t]
   (.id t))
 
-(defn task-deps
-  "Returns the deps of a task."
-  [^Task t]
-  (.deps t))
-
-(defn all-task-deps
-  "Returns an iterable of all deps of a task."
-  [^Task task]
-  (let [deps (reify Function
-               (apply [_ task]
-                 (or (task-deps task)
-                     [])))]
-    (Graphs/bfsVertices task deps)))
-
 (defn name
   "Returns the name of a task."
   [^Task t]
   (.name t))
+
+(defn data
+  "Returns the custom data associated with a task."
+  [^Task t]
+  (.data t))
+
+(defn dep-ids
+  "Returns a vector of dependency IDs of a task."
+  [^Task t]
+  (vec (.dep-ids t)))
 
 (defn ran?
   "Returns true iff a task ran already."
@@ -184,13 +317,12 @@
           (.forked (List.))))
 
 (defn ^Task get-task
-  "Fetches a Task from a state by ID."
-  [^State state, task-id]
+  "Fetches a Task from a state by ID. Returns nil if task is not known."
+  [^State state, ^long task-id]
   ;(info :get-task (.dep-graph state) task-id)
   (let [^DirectedGraph dep-graph (.dep-graph state)
         ; Taking advantage of our weird-ass equality/hashing semantics
-        ^OptionalLong i (.indexOf dep-graph
-                                  (Task. task-id nil nil nil nil nil))]
+        ^OptionalLong i (.indexOf dep-graph (pseudotask task-id))]
     (when (.isPresent i)
       (.nth dep-graph (.getAsLong i)))))
 
@@ -198,6 +330,22 @@
   "Takes a state and a task. Returns true iff the state knows about this task."
   [^State state, task]
   (.contains ^ISet (.vertices ^DirectedGraph (.dep-graph state)) task))
+
+(defn deps
+  "Given a State and a Task, returns a vector of Tasks that this task depends
+  on. Tasks are nil where the task is no longer known."
+  [state ^Task task]
+  (mapv (partial get-task state) (.dep-ids task)))
+
+(defn all-deps
+  "Returns an iterable of all deps of a task: a flat series of Tasks. Some may
+  be nil if they're no longer in the state."
+  [state ^Task task]
+  (let [deps (reify Function
+               (apply [_ task]
+                 (or (vals (deps task))
+                     [])))]
+    (Graphs/bfsVertices task deps)))
 
 (defn pending?
   "Takes a state and a task. Returns true iff that task is still pending
@@ -218,8 +366,7 @@
         ; A Function which finds dependencies of a task
         deps (reify Function
                (apply [_ task]
-                 (or (task-deps task)
-                     [])))]
+                 (or (deps task) [])))]
     (loopr []
            [t (Graphs/bfsVertices task deps)]
            (and (not (.contains running t))
@@ -235,10 +382,10 @@
        (= 0 (.size ^ISet (.ready-tasks state)))
        (= 0 (.size ^ISet (.running-tasks state)))))
 
-(defn new-task
-  "Given a state, constructs a fresh task with the given name, collection of
-  Tasks as dependencies, a function (f dep-results) which takes a map of
-  dependency IDs to their results. Returns the state with the new task
+(defn submit*
+  "Given a state, constructs a fresh task with the given name, optional data,
+  optional list of Tasks as dependencies, and a function (f dep-results) which
+  takes a vector of dependency results. Returns the state with the new task
   integrated, including a [:new-task task], which you can use to read the
   created task.
 
@@ -248,62 +395,89 @@
   If the task has no dependencies, it may be ready immediately; the :new-task
   effect will be followed by a [:ready-task task] effect. In either case, the
   final effect *will* contain the newly created task."
-  [^State state name deps f]
-  (let [id         (.next-task-id state)
-        task       (Task. id name deps f (promise) (.executor state))
-        ; Update dependency graph
-        ^DirectedGraph dep-graph (.dep-graph state)
-        ^DirectedGraph dep-graph'
-        (loopr [^DirectedGraph g (.. dep-graph
-                                     linear
-                                     (add task))]
-               [^Task dep deps]
-               (do (assert+
-                     (instance? Task dep)
-                     IllegalArgumentException
-                     (str "Dependencies must be tasks, but got "
-                          (pr-str deps)))
-                   ; We don't want to add things back to the dep
-                   ; graph if they're already finished
-                   (if (.contains (.vertices g) dep)
-                     (recur (.link g dep task))
-                     ; Oh hang on, you're trying to add something that we don't
-                     ; have. Is it finished?
-                     (do (assert+ (realized? (.output dep))
-                                  IllegalStateException
-                                  (str "Task " (pr-str task) " dependency "
-                                       (pr-str dep)
-                                       " is unknown and has not finished. This could cause deadlock!"))
-                         (recur g))))
-               (.forked g))
-        ; Is the task ready now?
-        ready? (= 0 (.size ^ISet (.in dep-graph' task)))
-        ; If it's ready, we add it to the ready set
-        ready-tasks  ^ISet (.ready-tasks state)
-        ready-tasks' (if ready?
-                       (.add ready-tasks task)
-                       ready-tasks)
-        ; And record effects
-        effects ^IList (.effects state)
-        effects' (.addLast effects [:new-task task])
-        effects' (if ready?
-                   (.addLast effects' [:ready-task task])
-                   effects')]
-    ;(info :new-task task)
-    (assoc state
-           :next-task-id  (inc id)
-           :dep-graph     dep-graph'
-           :ready-tasks   ready-tasks'
-           :effects       effects')))
+  ([state name f]
+   (submit* state name nil nil f))
+  ([state name deps f]
+   (submit* state name nil deps f))
+  ([^State state name data deps f]
+   (assert+ (not (nil? name)))
+   (let [id         (.next-task-id state)
+         dep-count  (count deps)
+         dep-ids    (long-array dep-count)
+         inputs     (object-array dep-count)
+         _          (loopr [i 0]
+                           [dep deps]
+                           (do (aset dep-ids i (.id dep))
+                               (aset inputs i (.output dep))
+                               (recur (inc i))))
+         task       (Task. id name data dep-ids f inputs (promise)
+                           (.executor state))
+         ; Update dependency graph
+         ^DirectedGraph dep-graph (.dep-graph state)
+         ^DirectedGraph dep-graph'
+         (loopr [^DirectedGraph g (.. dep-graph
+                                      linear
+                                      (add task))]
+                [^Task dep deps]
+                (do (assert+
+                      (instance? Task dep)
+                      IllegalArgumentException
+                      (str "Dependencies must be tasks, but got "
+                           (pr-str deps)))
+                    ; We don't want to add things back to the dep
+                    ; graph if they're already finished
+                    (if (.contains (.vertices g) dep)
+                      (recur (.link g dep task))
+                      ; Oh hang on, you're trying to add something that we don't
+                      ; have. Is it finished?
+                      (do (assert+ (realized? (.output dep))
+                                   IllegalStateException
+                                   (str "Task " (pr-str task) " dependency "
+                                        (pr-str dep)
+                                        " is unknown and has not finished. This could cause deadlock!"))
+                          (recur g))))
+                (.forked g))
+         ; Is the task ready now?
+         ready? (= 0 (.size ^ISet (.in dep-graph' task)))
+         ; If it's ready, we add it to the ready set
+         ready-tasks  ^ISet (.ready-tasks state)
+         ready-tasks' (if ready?
+                        (.add ready-tasks task)
+                        ready-tasks)
+         ; And record effects
+         effects ^IList (.effects state)
+         effects' (.addLast effects [:new-task task])
+         effects' (if ready?
+                    (.addLast effects' [:ready-task task])
+                    effects')]
+     ;(info :new-task task)
+     (assoc state
+            :next-task-id  (inc id)
+            :dep-graph     dep-graph'
+            :ready-tasks   ready-tasks'
+            :effects       effects'))))
 
-(defn new-task+
-  "Like new-task, but returns [state new-task]. Useful for transactional task
-  creation."
-  [state name deps f]
-  (let [^State state' (new-task state name deps f)]
-    [state' (nth (.last ^IList (.effects state')) 1)]))
+(defn submit
+  "Like submit*, but also returns the created task: [state new-task]. This form
+  is more convenient for transactional task creation.
 
-(defn finish-task
+  Given a state, constructs a fresh task with the given name, optional data,
+  optional list of Tasks as dependencies, and a function (f dep-results) which
+  takes a vector of dependency results. Returns the state with the new task
+  integrated, including a [:new-task task], which you can use to read the
+  created task.
+
+  Dependencies must either be in the graph already, or realized, to prevent
+  deadlock."
+  ([state name f]
+   (submit state name nil nil f))
+  ([state name deps f]
+   (submit state name nil deps f))
+  ([state name deps data f]
+   (let [^State state' (submit* state name data deps f)]
+     [state' (nth (.last ^IList (.effects state')) 1)])))
+
+(defn finish
   "Takes a state and a task which has been executed, and marks it as completed.
   This deletes the state from the running set and returns the resulting state.
   It may also result in new tasks being ready."
@@ -342,7 +516,7 @@
            :dep-graph     dep-graph'
            :effects       effects')))
 
-(defn cancel-task
+(defn cancel
   "Takes a state and a task to cancel. Deletes the task, and any tasks which
   depend on it, from every part of the state."
   [^State state, ^Task task]
@@ -386,10 +560,11 @@
                (recur (.remove to-delete t)))]
     (when (< 0 (.size to-delete))
       (info "GCing" (.size to-delete) "unneeded tasks:" to-delete))
-    (reduce cancel-task state to-delete)))
+    (reduce cancel state to-delete)))
 
 (defn state-queue-claim-task*!
   "A support function for StateQueue.run. Definitely don't call this yourself.
+  I mean, *I* call it, but I've come to terms with my sins.
 
   Takes a state and a volatile. Tries to move a task from the ready set to the
   running set, and if that works, sets the volatile to that task. Otherwise
@@ -430,7 +605,7 @@
 (deftype StateQueue
   ; We don't actually NEED to lock anything, but it's the only way to get a
   ; Condition I've found. Maybe we just back off to Object.await?
-  [state, ^ReentrantLock lock, ^Condition not-empty seen?]
+  [state, ^ReentrantLock lock, ^Condition not-empty]
   BlockingQueue
   (isEmpty [this]
     (= 0 (.size this)))
@@ -451,11 +626,6 @@
                      (when (< 0 (.size ^ISet (.ready-tasks state')))
                        ; Someone else might be waiting
                        (.signal not-empty))
-                     (when (@seen? task)
-                       ; Oh no
-                       (warn "Task dequeued twice:" task "\n"
-                             (with-out-str (pprint state'))))
-                     (swap! seen? conj task)
                      task)
                  ; No tasks ready. Sleep more?
                  (if (< 0 nanos)
@@ -492,7 +662,7 @@
   4. The executor threads poll us, and we hand them tasks from the queue."
   [state-atom]
   (let [lock (ReentrantLock. false)]
-    (StateQueue. state-atom lock (.newCondition lock) (atom #{}))))
+    (StateQueue. state-atom lock (.newCondition lock))))
 
 
 (deftype Executor [; The ExecutorService which actually does work
@@ -526,14 +696,17 @@
   @(.state e))
 
 (def void-runnable
-  "A dummy runnable which only exists to wake up a ThreadPoolExecutor."
+  "A dummy runnable which only exists to wake up a ThreadPoolExecutor. Might
+  also be handy if you want to create tasks that do nothing, e.g. for
+  dependency graph sequencing tricks."
   (reify Runnable
     (run [this])))
 
 (defn apply-effects!
   "Attempts to apply all pending effects from an Executor's state. Side effects
   may be interleaved in any order. When an effect is applied it is removed from
-  the effect queue. Returns executor.
+  the effect queue. Returns executor. This is generally called automatically as
+  tasks complete; you shouldn't need to do it yourself.
 
   In the two-arity form, performs a specific effect."
   ([^Executor executor]
@@ -545,7 +718,6 @@
                           (assoc state :effects (List.))))]
      (doseq [effect @effects]
       (apply-effects! executor effect))))
-  ; Actually *do* a single side effect
   ([^Executor executor, [type, ^Task task]]
    ;(info :effect type task)
    (case type
@@ -564,7 +736,8 @@
   executor's state, then applies any pending side effects. Returns the state
   the function returned.
 
-  Locks executor queue, since txns may be ~expensive~."
+  Locks executor queue, since txns may be ~expensive~ and the threadpool is
+  constantly mutating it."
   [^Executor executor, f]
   (let [^ReentrantLock lock (.lock ^StateQueue (.queue executor))
         state' (try (.lock lock)
@@ -577,16 +750,28 @@
     state'))
 
 (defn finish-task!
-  "Tells an executor that a task is finished."
+  "Tells an executor that a task is finished. You probably don't need to call
+  this yourself; tasks call this automatically."
   [executor task]
-  (txn! executor #(finish-task % task)))
+  (txn! executor #(finish % task)))
 
 (defn submit!
-  "Submits a new task to an Executor. Takes a task name, a collection of Tasks
-  as dependencies, and a function `(f dep-results)` which receives a map of
-  dependency IDs to their results. Returns a newly created Task object."
-  [executor name deps f]
-  (let [; Create the task
-        ^State state' (txn! executor #(new-task % name deps f))
-        [_ task] (.last ^IList (.effects state'))]
-    task))
+  "Submits a new task to an Executor. Takes a task name, an optional collection
+  of Tasks as dependencies, optional data, and a function `(f dep-results)`
+  which receives a map of dependency IDs to their results. Returns a newly
+  created Task object."
+  ([executor name f]
+   (submit! executor name nil nil f))
+  ([executor name deps f]
+   (submit! executor name nil deps f))
+  ([executor name data deps f]
+   (let [; Create the task
+         ^State state' (txn! executor #(submit* % name data deps f))
+         [_ task] (.last ^IList (.effects state'))]
+     task)))
+
+(defn cancel!
+  "Cancels a task on an executor. Returns task."
+  [executor task]
+  (txn! executor #(cancel % task))
+  task)

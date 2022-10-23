@@ -24,39 +24,54 @@
         ; delivered
         block-on (fn [p f] (fn [in] @p (f in)))]
     (testing "a single op"
-      (let [a (t/submit! e :a nil (log! :a))]
+      (let [a (t/submit! e :a (log! :a))]
         (is (= 0 (t/id a)))
         ; Should be deref-able to result of computation, and actually happened.
-        (is (= [:a {}] @a))
+        (is (= [:a []] @a))
         ; Should have also logged its execution
-        (is (= [[:a {}]] @log))))
+        (is (= [[:a []]] @log))))
+
+    (testing "name and data"
+      (reset! log [])
+      (let [a (t/submit! e :a-name :custom-data nil (log! :a))]
+        (is (= 1 (t/id a)))
+        (is (= :a-name (t/name a)))
+        (is (= :custom-data (t/data a)))
+        (is (= [[:a []]] @log))))
 
     (testing "dependent ops"
       (reset! log [])
       (let [ap (promise)
-            a (t/submit! e :a nil   (block-on ap (log! :a)))
-            b (t/submit! e :b [a]   (log! :b))
-            _ (is (= 1 (t/id a)))
-            _ (is (= 2 (t/id b)))
+            a (t/submit! e :a nil (block-on ap (log! :a)))
+            b (t/submit! e :b [a] (log! :b))
+            _ (is (= 2 (t/id a)))
+            _ (is (= 3 (t/id b)))
             ; At this juncture a should be (or about to be) running and b
             ; should be waiting on a
             _ (is (not (realized? a)))
             _ (is (not (realized? b)))
             ; Allow a to run
             _ (deliver ap true)
-            a-res [:a {}]
+            a-res [:a []]
             _ (is (= a-res @a))
             ; b should run automatically, and receive a's output
-            b-res [:b {1 a-res}]
+            b-res [:b [a-res]]
             _ (is (= b-res @b))
             ; Both should have logged
             _ (is (= [a-res b-res]
                      @log))
             ; Now if we submit c which depends on both completed tasks, it
             ; should run immediately and still see their outputs
-            c (t/submit! e :c [a b] (log! :c))
-            c-res [:c {1 a-res, 2 b-res}]
+            c (t/submit! e :c [b a] (log! :c))
+            c-res [:c [b-res a-res]]
             _ (is (= c-res @c))]))))
+
+(deftest exception-test
+  (let [e (t/executor)]
+    (let [a (t/submit! e :a     (fn [_] (assert false)))
+          _ (is (thrown? AssertionError @a))
+          b (t/submit! e :b [a] (fn [a-in] :b))]
+      _ (is (thrown? AssertionError @b)))))
 
 (deftest cancel-test
   (let [e    (t/executor)
@@ -83,7 +98,7 @@
         d (t/submit! e :d [] (log! :d dp))
         ; Cancel a. This should also cancel b and c.
         state1 (t/txn! e (fn [state]
-                           (t/cancel-task state a)))
+                           (t/cancel state a)))
         ; Allow a to continue
         _ (deliver ap true)
         ; A should have blown up during execution
@@ -153,12 +168,36 @@
            ; We don't want to see a task more than once
            (do (is (not (seen? i)))
                ; Should have seen right inputs
-               (let [task           (nth tasks i)
-                     deps           (.deps task)
-                     expected-input (reduce (fn [ei dep]
-                                              (assoc ei
-                                                     (t/id dep)
-                                                     (t/name dep)))
-                                            {}
-                                            deps)]
+               (let [task (nth tasks i)
+                     ; Because dep-id = retval
+                     expected-input (t/dep-ids task)]
                  (is (= expected-input input)))))))
+
+(deftest mem-test
+  ; We don't want to retain all the memory in the entire dep tree when we
+  ; allocate a series tasks that depend on each other.
+  (let [heap-size (.maxMemory (Runtime/getRuntime))
+        free-size (.freeMemory (Runtime/getRuntime))
+        ; We want tasks to fit comfortably in memory
+        task-size (long (/ heap-size 20))
+        ; Which means we need n altogether to blow the heap
+        n         (long (/ (* heap-size 1.2) task-size))
+        task-array-size (int (/ task-size 8))
+        e         (t/executor)
+        make-big-ary (fn task [_]
+                       (print ".") (flush)
+                       (long-array task-array-size))
+        _ (info "creating" n "tasks, each using"
+                (long (/ task-size 1024 1024)) "MB"
+                "of"
+                (long  (/ heap-size 1024 1024)) "MB heap "
+                (str "(" (long (/ free-size 1024 1024)) "MB free)"))
+        ; Right, now make a linear stream of tasks, each making a big array
+        task (loop [i    0
+                    task nil]
+               (condp = i
+                 n task
+                 0 (recur (inc i) (t/submit! e i nil make-big-ary))
+                   (recur (inc i) (t/submit! e i [task] make-big-ary))))]
+    (is (= (alength @task) task-array-size))
+    ))

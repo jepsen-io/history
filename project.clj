@@ -13,15 +13,20 @@
                  [potemkin "0.4.6"]
                  ; Fast data structures
                  [io.lacuna/bifurcan "0.2.0-alpha6"]]
-  :repl-options {:init-ns jepsen.history}
   :profiles {:dev {:dependencies
                    [[org.clojure/clojure "1.10.3"]
                     [org.clojure/test.check "1.1.1"]
                     [org.slf4j/slf4j-simple "2.0.3"]
                     [cheshire "5.11.0"]
                     ]}}
-  :test-selectors {:default (fn [m]
-                              (not (or (:perf m)
-                                       (:integration m))))
+  :repl-options {:init-ns jepsen.history}
+  ; We deliberatly want a reasonable heap here, because our tests are going to
+  ; blow it up.
+  :jvm-opts ["-Xmx8g" "-server"
+;             "-agentpath:/home/aphyr/yourkit/bin/linux-x86-64/libyjpagent.so=disablestacktelemetry,exceptions=disable,delay=10000,usedmem=50"
+             ]
+  :test-selectors {:default (fn [m] (not (:perf m)))
+                   :all         (fn [m] true)
                    :focus       :focus
+                   :slow        :slow
                    :perf        :perf})
