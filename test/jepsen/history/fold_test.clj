@@ -675,7 +675,7 @@
 
 ; LORGE DATA
 (defspec ^:perf ^:focus fold-equiv-parallel-perf 10
-  (let [dog-count 10000000]
+  (let [dog-count 100000000]
     (prop/for-all [dogs       (gen/not-empty dogs-gen)
                    ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
                    folds      (gen/not-empty (gen/vector basic-fold-gen))]

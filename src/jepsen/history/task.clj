@@ -197,7 +197,7 @@
 (defn has-task?
   "Takes a state and a task. Returns true iff the state knows about this task."
   [^State state, task]
-  (.contains (.vertices (.dep-graph state)) task))
+  (.contains ^ISet (.vertices ^DirectedGraph (.dep-graph state)) task))
 
 (defn pending?
   "Takes a state and a task. Returns true iff that task is still pending
@@ -257,7 +257,7 @@
         (loopr [^DirectedGraph g (.. dep-graph
                                      linear
                                      (add task))]
-               [dep deps]
+               [^Task dep deps]
                (do (assert+
                      (instance? Task dep)
                      IllegalArgumentException
@@ -380,9 +380,10 @@
                                          :task task
                                          :state state}))))))
         ; Walk the graph backwards from goal, cancelling tasks
-        to-delete (loopr [to-delete (.linear (Set/from to-delete))]
-                         [t (Graphs/bfsVertices ^Iterable goal deps)]
-                         (recur (.remove to-delete t)))]
+        ^ISet to-delete
+        (loopr [^ISet to-delete (.linear (Set/from ^Iterable to-delete))]
+               [t (Graphs/bfsVertices ^Iterable goal deps)]
+               (recur (.remove to-delete t)))]
     (when (< 0 (.size to-delete))
       (info "GCing" (.size to-delete) "unneeded tasks:" to-delete))
     (reduce cancel-task state to-delete)))
@@ -548,7 +549,7 @@
 
   Locks executor queue, since txns may be ~expensive~."
   [^Executor executor, f]
-  (let [lock (.lock ^StateQueue (.queue executor))
+  (let [^ReentrantLock lock (.lock ^StateQueue (.queue executor))
         state' (try (.lock lock)
                     (swap! (.state executor) f)
                     (finally (.unlock lock)))]

@@ -673,7 +673,7 @@
         ; C2 since it's our only way to see effects of R2. We scan back and
         ; find the last missing reducer; we can't cancel anything prior. Ditto,
         ; last missing combiner.
-        last-missing-fn (fn last-missing-fn [ary]
+        last-missing-fn (fn last-missing-fn [^objects ary]
                           (loop [i (dec n)]
                             (if-not (aget ary i)
                               i
@@ -891,17 +891,12 @@
             ; The deliver fn takes post-combined results, which means a pair
             ; of [old-result new-result]
             deliver-fn (fn deliver-acc [[old-res new-res]]
-                         (info :joint-delivery (:name fused)
-                               old-res new-res)
-                         (info :old-deliver old-deliver)
+                         ;(info :joint-delivery (:name fused) old-res new-res)
                          (old-deliver old-res)
-                         (info :new-deliver new-deliver)
-                         (new-deliver new-res)
-                         (info :joint-delivery-complete (:name fused)))
+                         (new-deliver new-res))
             state' @vstate
             [state' deliver-task]
             (make-deliver-task state' fused combine-task deliver-fn)
-            _ (info :new-delivery-task deliver-task)
 
             ; Right, now we go back and garbage collect every task *not*
             ; involved in producing our output. Should be able to drop this now
@@ -1066,7 +1061,6 @@
         chunks     (hc/chunks history)
         result     (promise)
         deliver-fn (fn [r]
-                     (info :single-delivery (:name fold) r)
                      (deliver result r)
                      ; TODO: make this async (use task executor!)
                      ;(clear-old-passes! e)
@@ -1109,12 +1103,12 @@
           ; Associative fold
           true
           (let [res (:result (concurrent-fold! executor fold))]
-            ;@res
-            (let [res (deref res 5000 ::timeout)]
-              (when (= ::timeout res)
-                (warn "Timed out!" (:name fold) (with-out-str (pprint (-> executor .task-executor task/executor-state))))
-                (throw (ex-info "timeout"
-                                {:name  (:name fold)
-                                 :state (-> executor .task-executor task/executor-state)})))
-             res
-            )))))
+            @res
+            ;(let [res (deref res 5000 ::timeout)]
+            ;  (when (= ::timeout res)
+            ;    (warn "Timed out!" (:name fold) (with-out-str (pprint (-> executor .task-executor task/executor-state))))
+            ;    (throw (ex-info "timeout"
+            ;                    {:name  (:name fold)
+            ;                     :state (-> executor .task-executor task/executor-state)})))
+            ; res)
+            ))))
