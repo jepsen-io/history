@@ -144,7 +144,7 @@
   (:import (io.lacuna.bifurcan DirectedGraph
                                IEdge
                                IGraph
-                               Graph))) 
+                               Graph)))
 
 ; We want to run multiple folds concurrently. This FusedFold datatype allows
 ; that, and can be extended with new folds later. It returns a vector of
@@ -513,8 +513,8 @@
                (.append sb " [")
                (loopr [i 0]
                       [task tasks]
-                      (do (when (pos? i)
-                            (.append sb " "))
+                      (do ;(when (pos? i)
+                          ;  (.append sb " "))
                           (cond (= :cancelled task)
                                 (.append sb "x ")
 
@@ -656,9 +656,7 @@
         ; We need to cancel the old deliver task if we're going to preserve
         ; exactly-once execution. Should do early return here later--maybe
         ; split up fn?
-        _ (when old-deliver-task
-            (info "Cancel delivery task" old-deliver-task)
-            (cancel! old-deliver-task))
+        _ (when old-deliver-task (cancel! old-deliver-task))
 
         _ (info (str "Original folds:\n"
                      (print-join-plan n @vstate

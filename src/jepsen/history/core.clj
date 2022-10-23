@@ -108,7 +108,10 @@
     chunks))
 
 (defn chunked
-  "Slices up a collection into chunks of the given size, and makes a Chunkable
-  out of them."
-  [n coll]
-  (Chunked. (reducible-chunk n coll)))
+  "Takes a collection of chunks and creates a Chunked wrapper around them. Or,
+  with two args, slices up a collection into chunks of the given size, and
+  makes a Chunked out of them."
+  ([chunks]
+   (Chunked. chunks))
+  ([n coll]
+   (Chunked. (reducible-chunk n coll))))

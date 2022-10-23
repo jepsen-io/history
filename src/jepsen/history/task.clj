@@ -396,10 +396,27 @@
   sets the volatile to nil."
   [^State state, vol]
   (let [^ISet ready (.ready-tasks state)]
-    (if (= 0 (.size ready))
+    (let [size (.size ready)]
+    (if (= 0 size)
+      ; Empty
       (do (vreset! vol nil)
           state)
-      (let [task (.nth ready 0)]
+      (let [; We do something a bit sneaky here: if there's more than a handful
+            ; of tasks, we sample several and pick the one with the lowest ID.
+            ; This gives us a good chance of leaving later dependency tasks for
+            ; later, which makes joining folds more efficient. Later we might
+            ; want an actual prioqueue? Or timing hints?
+            task (if (< size 5)
+                    (.nth ready 0)
+                    (loop [i    1
+                           task (.nth ready 0)]
+                      (if (= i 5)
+                        task
+                        (let [task' (.nth ready i)]
+                          (recur (unchecked-inc-int i)
+                                 (if (< (id task) (id task'))
+                                   task
+                                   task'))))))]
         (when (.contains ^ISet (.running-tasks state) task)
           (warn "Task" task "is both ready AND running:"
                 (with-out-str (pprint state))))
@@ -408,7 +425,7 @@
         (vreset! vol task)
         (assoc state
                :ready-tasks   (.remove ready task)
-               :running-tasks (.add ^ISet (.running-tasks state) task))))))
+               :running-tasks (.add ^ISet (.running-tasks state) task)))))))
 
 (deftype StateQueue
   ; We don't actually NEED to lock anything, but it's the only way to get a

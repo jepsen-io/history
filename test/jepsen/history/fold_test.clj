@@ -1,6 +1,9 @@
 (ns jepsen.history.fold-test
-  (:require [clojure [pprint :refer [pprint]]
+  (:require [cheshire.core :as json]
+            [clojure [pprint :refer [pprint]]
                      [test :refer :all]]
+            [clojure.java [io :as io]
+                          [shell :refer [sh]]]
             [clojure.test.check [clojure-test :refer :all]
                                 [generators :as gen]
                                 [properties :as prop]
@@ -88,24 +91,27 @@
   "A fold which always ignores inputs and returns name, and checks that name is
   threaded through correctly at every turn."
   [name]
-  {:name         name
-   :associative? true
-   :model       (fn [_] name)
-   :reducer-identity (constantly [:r name])
-   :reducer (fn [acc _]
-              (assert (= acc [:r name]))
-              acc)
-   :post-reducer (fn [acc]
-                   (assert (= acc [:r name]))
-                   [:pr name])
-   :combiner-identity (constantly [:combine name])
-   :combiner (fn [acc reduced-acc]
-               (assert (= acc [:combine name]))
-               (assert (= reduced-acc [:pr name]))
-               acc)
-   :post-combiner (fn [acc]
-                    (assert (= acc [:combine name]))
-                    name)})
+  (let [red [:r name]
+        postred [:pr name]
+        comb  [:combine name]]
+    {:name         name
+     :associative? true
+     :model       (fn [_] name)
+     :reducer-identity (constantly red)
+     :reducer (fn reducer [acc _]
+                (assert (identical? acc red))
+                acc)
+     :post-reducer (fn post-reducer [acc]
+                     (assert (identical? acc red))
+                     postred)
+     :combiner-identity (constantly comb)
+     :combiner (fn combiner [acc reduced-acc]
+                 (assert (identical? acc comb))
+                 (assert (identical? reduced-acc postred))
+                 acc)
+     :post-combiner (fn post-combiner [acc]
+                      (assert (identical? acc comb))
+                      name)}))
 
 (def fold-type-gen
   "Generates folds which ignore input and return name, checking type safety."
@@ -673,8 +679,8 @@
                                             folds)]
                     (all-results results)))))
 
-; LORGE DATA
-(defspec ^:perf ^:focus fold-equiv-parallel-perf 10
+; LORGE DATA. This one still tests safety and compares results to the models.
+(defspec ^:perf fold-equiv-parallel-lorge n
   (let [dog-count 100000000]
     (prop/for-all [dogs       (gen/not-empty dogs-gen)
                    ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
@@ -682,10 +688,77 @@
                   ; Just for now, cuz all I implemented was concurrent folds
                   (let [folds (mapv #(assoc % :associative? true) folds)
                         dogs  (vec (take dog-count (cycle dogs)))
-                        chunk-size (long (/ (count dogs) 32))]
+                        chunk-size (long (/ (count dogs) 64))]
                     (info "parallel dogs" (count dogs) "chunk-size" chunk-size
                           "folds" (mapv :name folds))
                     (let [executor (f/executor (hc/chunked chunk-size dogs))
                           results  (real-pmap (partial test-fold executor dogs)
                                               folds)]
                       (all-results results))))))
+
+
+; This one's *just* for perf testing. Spews JSON to a file then folds over it as if it were tons of files.
+(deftest ^:perf ^:focus fold-parallel-perf
+  ; a billion dogs might be enough -- nona, probably
+  (let [dog-count   1e7
+        chunk-count 100
+        dogs-per-file (Math/ceil (/ dog-count chunk-count))
+        sample-size 1e4
+        samples-per-file (Math/ceil (/ dogs-per-file sample-size))
+        ; Generate just a few for interest
+        dog-sample (gen/sample dog-gen sample-size)
+        ; Write a file with the sample
+        dir         "dogs"
+        sample-file (str dir "/sample.json")
+        dogs-file   (str dir "/dogs.json")
+        ; WARNING: Uncomment this if you change the tuning parameters above, or
+        ; delete the file yourself.
+        _ (io/delete-file dogs-file true)
+        _ (when-not (.exists (io/file dogs-file))
+            (info "Making small JSON sample")
+            (io/make-parents sample-file)
+            (with-open [w (io/writer sample-file)]
+              (doseq [dog dog-sample]
+                (json/generate-stream dog w)
+                (.write w "\n")))
+            (info "Making that sample... large")
+            (dotimes [_ samples-per-file]
+              (sh "sh" "-c" (str "cat " sample-file " >> " dogs-file)))
+            (io/delete-file sample-file)
+            )
+        ; Set up chunks over that file. Pretend we have lots of files even
+        ; though it's just the one.
+        chunks-fn #(->> (repeat dogs-file)
+                        (take chunk-count)
+                        (map (fn [file]
+                               (json/parsed-seq (io/reader file) true)))
+                        hc/chunked)
+        exec (f/executor (chunks-fn))]
+    (dotimes [i 1]
+      ; Do a pass!
+      (let [folds (->> (gen/sample basic-fold-gen (inc (rand-int 10)))
+                       ; Haven't done sequential folds yet
+                       (mapv #(assoc % :associative? true)))
+            _ (println "Starting concurrent folds" (pr-str (map :name folds)))
+            t0      (System/nanoTime)
+            results (real-pmap (partial f/fold exec) folds)
+            t1      (System/nanoTime)
+            _ (println "Finished folds in " (secs (- t1 t0)) " seconds")
+            _ (prn (mapv :name folds))
+            _ (prn results)
+            ; Now compare to serial
+            _ (println)
+            _ (println "Comparing to serial execution...")
+            t0 (System/nanoTime)
+            results1 (mapv (fn [fold]
+                             (prn :fold (:name fold))
+                             (apply-fold-with-reduce
+                               fold
+                               (apply concat (hc/chunks (chunks-fn)))))
+                           folds)
+            t1 (System/nanoTime)
+            _ (println "Finished serial folds in " (secs (- t1 t0)) " seconds")
+            _ (prn (mapv :name folds))
+            _ (prn results1)
+            ]))))
+

@@ -18,6 +18,7 @@
                    [[org.clojure/clojure "1.10.3"]
                     [org.clojure/test.check "1.1.1"]
                     [org.slf4j/slf4j-simple "2.0.3"]
+                    [cheshire "5.11.0"]
                     ]}}
   :test-selectors {:default (fn [m]
                               (not (or (:perf m)
