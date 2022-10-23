@@ -7,11 +7,15 @@
                                 [results :as results :refer [Result]]
                                 [rose-tree :as rose]]
             [clojure.tools.logging :refer [info warn]]
-            [dom-top.core :refer [letr loopr real-pmap]]
+            [dom-top.core :refer [assert+ letr loopr real-pmap]]
             [jepsen.history [core :as hc]
                             [fold :as f]
                             [task :as t]])
-  (:import (java.io StringWriter)))
+  (:import (io.lacuna.bifurcan ISet
+                               IList
+                               IMap
+                               List)
+             (java.io StringWriter)))
 
 (def n
   "How aggressive should tests be?"
@@ -80,9 +84,40 @@
     (assoc fold-count
            :associative? assoc?)))
 
+(defn fold-type
+  "A fold which always ignores inputs and returns name, and checks that name is
+  threaded through correctly at every turn."
+  [name]
+  {:name         name
+   :associative? true
+   :model       (fn [_] name)
+   :reducer-identity (constantly [:r name])
+   :reducer (fn [acc _]
+              (assert (= acc [:r name]))
+              acc)
+   :post-reducer (fn [acc]
+                   (assert (= acc [:r name]))
+                   [:pr name])
+   :combiner-identity (constantly [:combine name])
+   :combiner (fn [acc reduced-acc]
+               (assert (= acc [:combine name]))
+               (assert (= reduced-acc [:pr name]))
+               acc)
+   :post-combiner (fn [acc]
+                    (assert (= acc [:combine name]))
+                    name)})
+
+(def fold-type-gen
+  "Generates folds which ignore input and return name, checking type safety."
+  (gen/let [name (gen/elements [:a :b :c :d])
+            assoc? (gen/elements [true false])]
+    (assoc (fold-type name)
+           :associative? assoc?)))
+
 (def fold-mean-cuteness
   "A fold designed to stress all the reduce/combine steps"
-  {:name :mean-cuteness
+  {:name          :mean-cuteness
+   :associative?  true
    :model (fn [dogs]
             (if (seq dogs)
               (/ (reduce + 0 (map :cuteness dogs))
@@ -121,18 +156,14 @@
     (assoc (:fused (f/fuse old-fold new-fold))
            :name [(:name old-fold) (:name new-fold)]
            :model (fn [dogs]
-                    (let [old-res ((:model old-fold) dogs)
-                          new-res ((:model new-fold) dogs)]
-                      (if (f/fused? old-fold)
-                        ; Fusing into a fused fold yields a flat vector.
-                        (conj old-res new-res)
-                        ; Pair of plain folds
-                        [old-res new-res]))))))
+                    [((:model old-fold) dogs)
+                     ((:model new-fold) dogs)]))))
 
 (def basic-fold-gen
   "Makes a random, basic fold over dogs"
   (gen/one-of
-    [fold-count-gen
+    [fold-type-gen
+     fold-count-gen
      fold-mean-cuteness-gen]))
 
 (def fold-gen
@@ -152,13 +183,13 @@
                       ((:reducer fold) acc x)))))
 
 (defn concurrent-pass
-  "Constructs a fresh concurrent pass over chunks. Always does an associative
-  count."
+  "Constructs a fresh concurrent pass over chunks. Always does a type pass."
   [chunks]
-  {:type    :concurrent
-   :chunks  chunks
-   :fold    fold-count
-   :deliver (fn [x])})
+  (let [result (promise)]
+    (assoc (f/concurrent-pass chunks (fold-type (rand-nth [:a :b :c :d]))
+                              (fn [x] ;(info :concurrent-pass-deliver x)
+                                (deliver result x)))
+           :result result)))
 
 (defn concurrent-pass-gen
   "Generates a fresh concurrent pass over chunks."
@@ -181,27 +212,57 @@
   (gen/let [n small-pos-int]
     (gen/vector (gen/elements [:run :finish]) n)))
 
-(defn apply-task-state-steps
-  "Takes a state and a sequence of steps, and applies those states to the
-  steps, returning the new state (with empty effects)."
-  [state steps]
+(defn apply-task-state-step
+  "Takes a state and a step (either :run or :finish), and applies that step to
+  the state, returning the new state (with empty effects). If no changes, returns state itself."
+  [state step]
   (let [; Side effect channel for pulling tasks off state
         last-task (volatile! nil)]
-    (loopr [state   state
-            running #{}]
-           [step steps]
-           (case step
-             :run (let [state' (t/state-queue-claim-task*! state last-task)]
-                    (if (identical? state state')
-                      (recur state' running)
-                      (recur state' (conj running @last-task))))
-             :finish (if-let [task (first running)]
-                       (do (.run ^Runnable task)
-                           (recur (t/finish-task state task)
-                                  (disj running task)))
-                       (recur state running)))
-           ; Trim side effects; no need for them here
-           (assoc state :effects (:effects (t/state))))))
+    (case step
+      :run (let [state' (t/state-queue-claim-task*! state last-task)]
+             (if (identical? state state')
+               state
+               (do ;(info "Claim task" @last-task)
+                   (assoc state' :effects (List.)))))
+
+      :finish (let [^ISet running (.running-tasks state)]
+                (if (pos? (.size running))
+                  ; Finish task
+                  (let [task (.nth running 0)]
+                    ;(info "Executing" task)
+                    (.run ^Runnable task)
+                    ; If it crashes, we want to blow up here!
+                    (assert (realized? (.output task)))
+                    @task
+                    (-> (t/finish-task state task)
+                        (assoc :effects (List.))))
+                  ; Nothing running
+                  state)))))
+
+(defn apply-task-state-steps
+  "Takes a state and a sequence of steps, and applies those steps to the
+  state, returning the new state (with empty effects)."
+  [state steps]
+  (reduce apply-task-state-step state steps))
+
+(defn exhaust-task-state
+  "Drives a task state forward to completion, possibly for side effects?
+  Returns final state."
+  [state]
+  (loop [state state]
+    (let [state' (apply-task-state-step state :run)]
+      (if-not (identical? state state')
+        (recur state')
+        (let [state' (apply-task-state-step state :finish)]
+          (if-not (identical? state state')
+            (recur state')
+            ; Nothing to do
+            (do (assert+ (t/state-done? state)
+                         {:type    :deadlock
+                          :running (.running-tasks state)
+                          :ready   (.ready-tasks state)
+                          :deps    (.dep-graph state)})
+                (assoc state :effects (:effects (t/state))))))))))
 
 (defn join-concurrent-passes
   "Joins a series of concurrent passes together. Takes a list of chunks, then
@@ -468,6 +529,31 @@
                              (f/print-join-plan
                                state' old-pass new-pass pass))))))))
 
+(defn join-concurrent-passes-result
+  "Takes inputs for join-concurrent-passes and returns a test.check result.
+  Basically checks each step of the join process independently, then finishes
+  the scheduler and asserts all folds terminate."
+  [inputs]
+  (let [steps (join-concurrent-passes inputs)
+        ; Check passes individually
+        pass-results (mapv join-concurrent-pass-result steps)
+        ; Finish execution of final pass
+        state (:state' (last steps))
+        state' (exhaust-task-state state)]
+    ;(prn)
+    ;(prn :exhausting-state)
+    ;(prn :state state')
+    (let [term-results
+          (->> steps
+               (map (fn [step]
+                      (let [pass   (:new-pass step)
+                            result (:result pass)]
+                        (prn :result result)
+                        (if (realized? result)
+                          (passing-result)
+                          (err :nontermination result))))))]
+      (all-results (concat pass-results term-results)))))
+
 ; We try to verify that concurrent pass join plans, you know, make *sense*
 ;
 ; Cheat sheet for REPL work here:
@@ -482,19 +568,20 @@
     (-> qc :shrunk :result-data :print (apply []))
     ; See input that failed
     (-> qc :shrunk :smallest first)
-    ; Re-run failing case by hand
-    (-> qc :shrunk :smallest first ft/join-concurrent-passes)
     ; Re-run with analysis
-    (-> qc :shrunk :smallest first ft/join-concurrent-passes last ft/join-concurrent-pass-result res/pass?)
-    (-> qc :shrunk :smallest first ft/join-concurrent-passes last ft/join-concurrent-pass-result res/result-data pprint)
+    (-> qc :shrunk :smallest first ft/join-concurrent-passes-result res/pass?)
+    (-> qc :shrunk :smallest first ft/join-concurrent-passes-result res/result-data pprint)
     )
 
 (defspec join-concurrent-passes-spec {:num-tests n
                                       ;:seed 1666379400858
                                       }
   (prop/for-all [inputs join-concurrent-passes-inputs-gen]
-                (let [steps (join-concurrent-passes inputs)]
-                  (all-results (map join-concurrent-pass-result steps)))))
+                (prn)
+                (prn)
+                (println "# RUN " inputs)
+                (prn)
+                (join-concurrent-passes-result inputs)))
 
 (defn apply-fold-with-reduce
   "Applies a fold naively using reduce"
@@ -503,13 +590,18 @@
            post-reducer
            combiner-identity
            combiner
-           post-combiner]}
+           post-combiner] :as fold}
    coll]
-  (->> coll
-       (reduce reducer (reducer-identity))
-       post-reducer
-       (combiner (combiner-identity))
-       post-combiner))
+  (let [reduced (reduce reducer (reducer-identity) coll)
+        ;_    (info :reduced reduced)
+        post-reduced (post-reducer reduced)
+        ;_ (prn :post-reduced (f/ary->vec post-reduced))
+        combined (combiner (combiner-identity) post-reduced)
+        ;_ (prn :combined (f/ary->vec combined))
+        post-combined (post-combiner combined)
+        ;_ (prn :post-combined post-combined)
+        ]
+    post-combined))
 
 (defspec fold-equiv-serial n
   (prop/for-all [dogs       dogs-gen
@@ -528,17 +620,31 @@
                           (= model-res reduce-res exec-res))
 
                         (result-data [_]
-                          {:model  model-res
+                          {:fold   (:name fold)
+                           :model  model-res
                            :reduce reduce-res
                            :exec   exec-res
                            :log    (str stdout)})))))))
 
+(defn secs
+  "Nanos to seconds"
+  [nanos]
+  (float (/ nanos 1000000000)))
+
 (defn test-fold
   "Runs fold on executor, returning a test.check Result"
   [executor dogs fold]
-  (let [model-res  ((:model fold) dogs)
+  (let [t0 (System/nanoTime)
+        exec-res   (f/fold executor fold)
+        t1 (System/nanoTime)
+        model-res  ((:model fold) dogs)
+        t2 (System/nanoTime)
         reduce-res (apply-fold-with-reduce fold dogs)
-        exec-res   (f/fold executor fold)]
+        t3 (System/nanoTime)]
+    (info "Tested fold" (:name fold)
+          "- exec"  (secs (- t1 t0))
+          " reduce" (secs (- t3 t2))
+          " model"  (secs (- t2 t1)))
     (reify Result
       (pass? [_]
         (= model-res reduce-res exec-res))
@@ -549,9 +655,13 @@
          :reduce reduce-res
          :exec   exec-res}))))
 
-(defspec ^:focus fold-equiv-parallel n
+; Submits a bunch of folds at the same time to a single executor. Stress-tests
+; all the concurrency safety!
+(defspec fold-equiv-parallel n
   (prop/for-all [dogs       dogs-gen
-                 chunk-size small-pos-int
+                 chunk-size (gen/scale (fn [size]
+                                         (inc (/ size 10)))
+                                         small-pos-int)
                  ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
                  folds      (gen/vector basic-fold-gen)]
                 ; Just for now, cuz all I implemented was concurrent folds
@@ -562,3 +672,20 @@
                         results  (real-pmap (partial test-fold executor dogs)
                                             folds)]
                     (all-results results)))))
+
+; LORGE DATA
+(defspec ^:perf ^:focus fold-equiv-parallel-perf 10
+  (let [dog-count 10000000]
+    (prop/for-all [dogs       (gen/not-empty dogs-gen)
+                   ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
+                   folds      (gen/not-empty (gen/vector basic-fold-gen))]
+                  ; Just for now, cuz all I implemented was concurrent folds
+                  (let [folds (mapv #(assoc % :associative? true) folds)
+                        dogs  (vec (take dog-count (cycle dogs)))
+                        chunk-size (long (/ (count dogs) 32))]
+                    (info "parallel dogs" (count dogs) "chunk-size" chunk-size
+                          "folds" (mapv :name folds))
+                    (let [executor (f/executor (hc/chunked chunk-size dogs))
+                          results  (real-pmap (partial test-fold executor dogs)
+                                              folds)]
+                      (all-results results))))))

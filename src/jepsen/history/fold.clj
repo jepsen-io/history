@@ -178,6 +178,13 @@
   [fold]
   (instance? FusedFold fold))
 
+(defn ary->vec
+  "Turns arrays into vectors recursively."
+  [x]
+  (if (= "[Ljava.lang.Object;" (.getName (class x)))
+    (mapv ary->vec x)
+    x))
+
 (defn fuse
   "Takes a fold (possibly a FusedFold) and fuses a new fold into it. Also
   provides a means of joining in-process reducer/combiner state together, so
@@ -185,7 +192,8 @@
   fold halfway through. Returns a map of:
 
     :fused              A new FusedFold which performs everything the original
-                        fold did *plus* the new fold.
+                        fold did *plus* the new fold. Its post-combined results
+                        are a pair of [old-res new-res].
 
     :join-accs          A function which joins together accumulators from the
                         original and new fold. Works on both reduce and combine
@@ -255,18 +263,6 @@
                          (aset accs i acc')
                          (recur (unchecked-inc-int i)))
                        accs)))
-        post-combiners (object-array (map :post-combiner folds'))
-        ; Turn things back into vectors on the way out
-        post-combiner (fn post-combiner [^objects accs]
-                        (loop [i     0
-                               accs' (transient [])]
-                          (if (< i n)
-                            (let [post-combiner (aget post-combiners i)
-                                  acc (aget accs i)
-                                  acc' (post-combiner acc)]
-                              (recur (unchecked-inc-int i)
-                                     (conj! accs' acc')))
-                            (persistent! accs'))))
         ; Now we need functions to join together reducer and combiner state.
         ; The shape here is going to depend on whether the original fold was a
         ; FusedFold (in which case it has an array of accs) or a normal fold
@@ -292,6 +288,14 @@
                      ; Both simple folds
                      (fn split-unfused [^objects accs]
                        [(aget accs 0) (aget accs 1)]))
+        ; Turn things back into a pair of [old-res new-res] on the way
+        ; out.
+        old-post-combiner (:post-combiner old-fold)
+        new-post-combiner (:post-combiner new-fold)
+        post-combiner (fn post-combiner [^objects accs]
+                        (let [[old-acc new-acc] (split-accs accs)]
+                          [(old-post-combiner old-acc)
+                           (new-post-combiner new-acc)]))
         fused (map->FusedFold
                 {:name              [(:name old-fold) (:name new-fold)]
                  :reducer-identity  reducer-identity
@@ -303,9 +307,9 @@
                  :associative?      (and (:associative? old-fold)
                                          (:associative? new-fold))
                  :folds             folds'})]
-    {:fused      fused
-     :join-accs  join-accs
-     :split-accs split-accs}))
+    {:fused               fused
+     :join-accs           join-accs
+     :split-accs          split-accs}))
 
 ; Task construction
 (defn make-reduce-task
@@ -329,14 +333,16 @@
 
   Returns [state' task]: a task which combines that chunk with earlier
   combines."
-  ([state {:keys [combiner-identity combiner]} chunks i reduce-task]
-   (task/new-task+ state
-                   [:combine i]
-                   [reduce-task]
-                   (fn first-task [inputs]
-                     (combiner
-                       (combiner-identity)
-                       @reduce-task))))
+  ([state {:keys [combiner-identity combiner]}
+    chunks i reduce-task]
+   (let [n (count chunks)]
+     (task/new-task+ state
+                     [:combine i]
+                     [reduce-task]
+                     (fn first-task [inputs]
+                       (let [res (combiner (combiner-identity) @reduce-task)]
+                         ;(info :combine i res)
+                         res)))))
   ([state {:keys [combiner post-combiner]}
     chunks i prev-combine-task reduce-task]
    (let [n (count chunks)]
@@ -345,20 +351,19 @@
                      [reduce-task prev-combine-task]
                      (fn task [_]
                        (let [res (combiner @prev-combine-task @reduce-task)]
-                         (if (= i (dec n))
-                           (post-combiner res)
-                           res)))))))
+                         ;(info :combine i res)
+                         res))))))
 
 (defn make-deliver-task
   "Takes a task executor state, a final combine task, and a function which
   delivers results to the output of a fold. Returns [state' task], where task
-  calls deliver-fn with the results of the final combine task."
-  [state task deliver-fn]
+  applies the post-combiner of the fold and calls deliver-fn with the results"
+  [state {:keys [post-combiner]} task deliver-fn]
   (task/new-task+ state
                   [:deliver]
                   [task]
                   (fn deliver [_]
-                    (deliver-fn @task))))
+                    (deliver-fn (post-combiner @task)))))
 
 (defn make-split-task
   "Takes a task executor state, a name, a function that splits an accumulator,
@@ -428,7 +433,7 @@
   (if (identical? task :cancelled)
     state
     (case (first (task/name task))
-      (:reduce, :combine)
+      (:reduce, :combine, :deliver)
       (task/cancel-task state task)
 
       (:split-reduce, :split-combine, :join-reduce, :join-combine)
@@ -449,6 +454,7 @@
   required to execute this pass. Returns [state' pass']."
   [state {:keys [chunks fold deliver] :as pass}]
   (let [n (count chunks)]
+    (assert (pos? n))
     (loop [i             0
            state         state
            reduce-tasks  []
@@ -466,12 +472,14 @@
                  (conj reduce-tasks  reduce-task)
                  (conj combine-tasks combine-task)))
         ; Done!
-        (let [[state task] (make-deliver-task state (nth combine-tasks (dec n))
-                                              deliver)]
+        (let [[state deliver-task]
+              (make-deliver-task state fold (nth combine-tasks (dec n))
+                                 deliver)]
           [state
            (assoc pass
                   :reduce-tasks  (mapv task/id reduce-tasks)
-                  :combine-tasks (mapv task/id combine-tasks))])))))
+                  :combine-tasks (mapv task/id combine-tasks)
+                  :deliver-task  (task/id deliver-task))])))))
 
 (defn print-join-plan
   "Draws an ASCII diagram of a concurrent pass. Helpful for debugging join
@@ -567,7 +575,8 @@
         old-fold             (:fold old-pass)
         new-fold             (:fold new-pass)
         ; Fuse folds
-        {:keys [fused join-accs split-accs]} (fuse old-fold new-fold)
+        {:keys [fused join-accs split-accs split-post-combined]}
+        (fuse old-fold new-fold)
         _ (when-not (:name old-fold)
             (warn :malformed-old-fold
                   (with-out-str (pprint old-fold))))
@@ -591,6 +600,7 @@
         ; Same arrays, same rules, but for the joined reduce/combine tasks.
         reduce-tasks      (object-array n)
         combine-tasks     (object-array n)
+        old-deliver-task  (get-task (:deliver-task old-pass))
 
         ; Now, like twitter, the goal of the game is to produce a pass which is
         ; maximally cancellable. The more of our reductions we can cancel
@@ -615,6 +625,7 @@
         task!             (fn task! [f & args]
                             (let [[state' task] (apply f @vstate args)]
                               (vreset! vstate state')
+                              (assert (not (false? task)))
                               task))
         ; Cancels a task in the mutable state. We also cancel all of the work
         ; for that chunk, in case it's a split/join task.
@@ -641,6 +652,11 @@
                                     (cancel! rt)
                                     (aset old-reduce-tasks i :cancelled)
                                     (cancel-old-combine-task! i)))
+
+        ; We need to cancel the old deliver task if we're going to preserve
+        ; exactly-once execution. Should do early return here later--maybe
+        ; split up fn?
+        _ (when old-deliver-task (cancel! old-deliver-task))
 
         _ (info (str "Original folds:\n"
                      (print-join-plan n @vstate
@@ -765,21 +781,22 @@
         combine-task!
         (fn combine-task! [i]
           (or (aget combine-tasks i)
-              (and ; We can't start fusing combines until we get past missing
-                   ; reducers/combiners.
-                   (< last-missing-combine-i i)
-                   ; Can we join?
-                   (let [old-ct (aget old-combine-tasks i)
-                         new-ct (aget new-combine-tasks i)]
-                     (when (and old-ct
-                                new-ct
-                                (not (identical? :cancelled old-ct))
-                                (or (task/ran? old-ct)
-                                    (task/has-task? @vstate old-ct)))
-                       ; Join
-                       (aset combine-tasks i
-                             (task! make-join-task [:join-combine i] join-accs
-                                    old-ct new-ct)))))))
+              ; We can't start fusing combines until we get past missing
+              ; reducers/combiners.
+              (when
+                (< last-missing-combine-i i)
+                ; Can we join?
+                (let [old-ct (aget old-combine-tasks i)
+                      new-ct (aget new-combine-tasks i)]
+                  (when (and old-ct
+                             new-ct
+                             (not (identical? :cancelled old-ct))
+                             (or (task/ran? old-ct)
+                                 (task/has-task? @vstate old-ct)))
+                    ; Join
+                    (aset combine-tasks i
+                          (task! make-join-task [:join-combine i] join-accs
+                                 old-ct new-ct)))))))
 
         ; Second pass: combines. These are trickier because each combine relies
         ; on every previous combine. However, because we want to enforce our
@@ -854,28 +871,30 @@
         combine-task (combine-task! (dec n))
       ]
 
-    (info (str "Combine plan:\n"
-               (print-join-plan n @vstate
-                                old-reduce-tasks old-combine-tasks
-                                reduce-tasks combine-tasks
-                                new-reduce-tasks new-combine-tasks)))
-    ;(info "Last missing reduce" last-missing-reduce-i)
+    ;(info (str "Combine plan:\n"
+    ;           (print-join-plan n @vstate
+    ;                            old-reduce-tasks old-combine-tasks
+    ;                            reduce-tasks combine-tasks
+    ;                            new-reduce-tasks new-combine-tasks)))
     ; We could have gotten something completely unmergeable--for instance, the
     ; last combiner or reducer could have been missing.
-    (if-not combine-task
+    (if (or (nil? combine-task)
+            (not (task/pending? state old-deliver-task)))
       ; If this happens, just launch the new pass on the original state.
       (launch-concurrent-pass state new-pass)
       ; Right, new plan is a go.
       (let [; side effects: delivering results
             old-deliver (:deliver old-pass)
             new-deliver (:deliver new-pass)
-            deliver-fn (fn deliver-acc [acc]
-                         (let [[old-acc new-acc] (split-accs acc)]
-                           (old-deliver old-acc)
-                           (new-deliver new-acc)))
+            ; The deliver fn takes post-combined results, which means a pair
+            ; of [old-result new-result]
+            deliver-fn (fn deliver-acc [[old-res new-res]]
+                         ;(info :joint-delivery old-res new-res)
+                         (old-deliver old-res)
+                         (new-deliver new-res))
             state' @vstate
             [state' deliver-task]
-            (make-deliver-task state' combine-task deliver-fn)
+            (make-deliver-task state' fused combine-task deliver-fn)
 
             ; Right, now we go back and garbage collect every task *not*
             ; involved in producing our output. Should be able to drop this now
@@ -912,7 +931,8 @@
           ; testing/debugging.
           :new-reduce-tasks  (mapv task-id new-reduce-tasks)
           :new-combine-tasks (mapv task-id new-combine-tasks)
-          :deliver       deliver-fn}]))))
+          :deliver-task      (task/id deliver-task)
+          :deliver           deliver-fn}]))))
 
 (deftype Executor
   [task-executor
@@ -1058,11 +1078,8 @@
       (swap! passes assoc :concurrent @resulting-pass))
     (let [pass @resulting-pass]
       (if (:joined? pass)
-        (info "Joined!"
-              (with-out-str (pprint pass)))
-        ;(info "Didn't join!"
-        ;      (with-out-str (pprint pass)))
-        )
+        (info "Joined!" (:name (:fold pass)))
+        (info "Didn't join!" (:name (:fold pass))))
       (assoc pass :result result))))
 
 (defn fold
@@ -1081,4 +1098,13 @@
 
           ; Associative fold
           true
-          @(:result (concurrent-fold! executor fold)))))
+          (let [res (:result (concurrent-fold! executor fold))]
+            ;@res
+            (let [res (deref res 5000 ::timeout)]
+              (when (= ::timeout res)
+                (warn "Timed out!" (:name fold) (with-out-str (pprint (-> executor .task-executor task/executor-state))))
+                (throw (ex-info "timeout"
+                                {:name  (:name fold)
+                                 :state (-> executor .task-executor task/executor-state)})))
+             res
+            )))))

@@ -4,7 +4,7 @@
   etc."
   (:refer-clojure :exclude [name])
   (:require [clojure [pprint :as pprint :refer [pprint]]]
-            [clojure.tools.logging :refer [info warn]]
+            [clojure.tools.logging :refer [info warn fatal]]
             [dom-top.core :refer [assert+ loopr]])
   (:import (clojure.lang IDeref
                          IBlockingDeref
@@ -79,11 +79,17 @@
                              (recur (assoc! m (.id task) @task))
                              (persistent! m))]
            (deliver output (f inputs)))
+         ; TODO: sort out exactly what classes we should catch & propagate
+         ; here. Java people love to do Weird Things in the exception
+         ; hierarchy. Check real-pmap from dom-top?
          (catch Throwable t
            (deliver output t)))
        ; Inform executor we're done
-       (when executor
-         (finish-task! executor this)))
+       (try
+         (when executor
+           (finish-task! executor this))
+         (catch Throwable t
+           (fatal t "Error finishing task!" this))))
 
   Object
   (hashCode [this]
@@ -377,7 +383,8 @@
         to-delete (loopr [to-delete (.linear (Set/from to-delete))]
                          [t (Graphs/bfsVertices ^Iterable goal deps)]
                          (recur (.remove to-delete t)))]
-    (info "GCing" (.size to-delete) "unneeded tasks:" to-delete)
+    (when (< 0 (.size to-delete))
+      (info "GCing" (.size to-delete) "unneeded tasks:" to-delete))
     (reduce cancel-task state to-delete)))
 
 (defn state-queue-claim-task*!
@@ -473,7 +480,9 @@
 (deftype Executor [; The ExecutorService which actually does work
                    ^ExecutorService executor-service
                    ; An atom containing our current state.
-                   state])
+                   state
+                   ; Our state queue
+                   ^StateQueue queue])
 
 (defn executor
   "Constructs a new Executor for tasks. Executors are mutable thread-safe
@@ -487,7 +496,7 @@
                                         1 TimeUnit/SECONDS ; keepalive
                                         state-queue)
                (.allowCoreThreadTimeOut true))
-        this (Executor. exec state)]
+        this (Executor. exec state state-queue)]
     ; Tie the knot: the state needs to have a reference back to the executor so
     ; tasks created on it can clear themselves from our state when finished
     (swap! state assoc :executor this)
@@ -535,9 +544,14 @@
   "Executes a transaction on an executor. Takes an executor and a function
   which transforms that executor's State. Applies that function to the
   executor's state, then applies any pending side effects. Returns the state
-  the function returned."
+  the function returned.
+
+  Locks executor queue, since txns may be ~expensive~."
   [^Executor executor, f]
-  (let [state' (swap! (.state executor) f)]
+  (let [lock (.lock ^StateQueue (.queue executor))
+        state' (try (.lock lock)
+                    (swap! (.state executor) f)
+                    (finally (.unlock lock)))]
     ;(info :txn! (with-out-str (pprint @caller-state)))
     ; Apply side effects
     (apply-effects! executor)
