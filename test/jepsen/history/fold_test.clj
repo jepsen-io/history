@@ -224,7 +224,7 @@
 
 (def fold-mut-legs-gen
   "Generates a mutable legs fold."
-  (gen/let [assoc? (gen/elements [true false])]
+  (gen/let [assoc? gen/boolean]
     (assoc fold-mut-legs
            :associative? assoc?)))
 
@@ -244,11 +244,14 @@
 
 (def basic-fold-gen
   "Makes a random, basic fold over dogs"
-  (gen/one-of
-    [fold-type-gen
-     fold-count-gen
-     fold-mean-cuteness-gen
-     fold-mut-legs-gen]))
+  (gen/let [asap? gen/boolean
+            fold (gen/one-of
+                   [fold-type-gen
+                    fold-count-gen
+                    fold-mean-cuteness-gen
+                    fold-mut-legs-gen])]
+    (assoc fold :asap? asap?)))
+
 
 (def fold-gen
   "Makes a (possibly recursively fused) fold over dogs."
@@ -829,16 +832,19 @@
         exec (f/executor (chunks-fn))]
     (dotimes [i 1]
       ; Do a pass!
-      (let [folds (->> (gen/sample basic-fold-gen (inc (rand-int 10)))
-                       ; Haven't done sequential folds yet
-                       (mapv #(assoc % :associative? true)))
+      (let [folds (->> (gen/sample basic-fold-gen 10)
+                       (mapv #(assoc %
+                                     ; Assoc is faster
+                                     :associative? true
+                                     ; ASAP slower for multiple folds
+                                     :asap? false)))
             _ (println "Starting concurrent folds" (pr-str (map :name folds)))
             t0      (System/nanoTime)
             results (real-pmap (partial f/fold exec) folds)
             t1      (System/nanoTime)
             _ (println "Finished folds in " (secs (- t1 t0)) " seconds")
             _ (prn (mapv :name folds))
-            _ (prn results)
+            _ (binding [*print-length* 8] (prn results))
             ; Now compare to serial
             _ (println)
             _ (println "Comparing to serial execution...")
@@ -852,6 +858,6 @@
             t1 (System/nanoTime)
             _ (println "Finished serial folds in " (secs (- t1 t0)) " seconds")
             _ (prn (mapv :name folds))
-            _ (prn results1)
+            _ (binding [*print-length* 4] (prn results1))
             ]))))
 

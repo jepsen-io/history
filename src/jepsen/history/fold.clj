@@ -298,14 +298,16 @@
                            (new-post-combiner new-acc)]))
         fused (map->FusedFold
                 {:name              [(:name old-fold) (:name new-fold)]
+                 :associative?      (and (:associative? old-fold)
+                                         (:associative? new-fold))
+                 :asap?             (or (:asap? old-fold)
+                                        (:asap? new-fold))
                  :reducer-identity  reducer-identity
                  :reducer           reducer
                  :post-reducer      post-reducer
                  :combiner-identity combiner-identity
                  :combiner          combiner
                  :post-combiner     post-combiner
-                 :associative?      (and (:associative? old-fold)
-                                         (:associative? new-fold))
                  :folds             folds'})]
     {:fused               fused
      :join-accs           join-accs
@@ -335,15 +337,17 @@
   previously launched reduce tasks for this fold, and an index into the chunks
   i. Returns [state' task]: a new task to reduce that chunk.
 
-  This is less speedy for single folds, but for multiple folds we actually want
-  to *defer* starting work until later--that way the later folds have a chance
-  to join and cancel our tasks. So even though we *could* rush ahead and launch
-  every reduce concurrently, we inject dependencies between reduce
-  tasks forming a tree: the first chunk unlocks the second and third, which
-  unlock the fourth through seventh, and so on."
-  [state {:keys [reducer-identity, reducer, post-reducer]} chunks
+  Unless the fold requests `:asap? true`, we introduce synthetic dependencies
+  to slow down later reductions. This is less speedy for single folds, but for
+  multiple folds we actually want to *defer* starting work until later--that
+  way the later folds have a chance to join and cancel our tasks. So even
+  though we *could* rush ahead and launch every reduce concurrently, we inject
+  dependencies between reduce tasks forming a tree: the first chunk unlocks the
+  second and third, which unlock the fourth through seventh, and so on."
+  [state {:keys [asap? reducer-identity, reducer, post-reducer]} chunks
    prev-reduce-tasks i]
-  (let [ordering-dep (when (seq prev-reduce-tasks)
+  (let [ordering-dep (when (and (not asap?)
+                                (seq prev-reduce-tasks))
                        (nth prev-reduce-tasks
                             (long (/ (count prev-reduce-tasks)
                                      concurrent-reduce-task-unlock-factor))))]
@@ -914,14 +918,6 @@
             state' @vstate
             [state' deliver-task]
             (make-deliver-task state' fused combine-task deliver-fn)
-
-            ; Right, now we go back and garbage collect every task *not*
-            ; involved in producing our output. Should be able to drop this now
-            ; that we're conservative w/pruning.
-            state' (->> (concat old-reduce-task-ids old-combine-task-ids)
-                        (remove nil?)
-                        (keep (partial task/get-task state'))
-                        (task/gc state' [deliver-task]))
 
             ; Log resulting plan
             ;_ (info (str "Final join plan\n"
