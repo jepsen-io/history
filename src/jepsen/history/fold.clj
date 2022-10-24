@@ -312,18 +312,50 @@
      :split-accs          split-accs}))
 
 ; Task construction
+
+(defn task-workers
+  "Takes a Task and returns a vector of tasks which actually do work (e.g. call
+  a reducer or combiner) for this particular chunk. We need this to figure out
+  if tasks are safely cancellable, or if some of their work has begun."
+  [task]
+  (case (first (task/name task))
+    (:reduce, :combine, :deliver)
+    [task]
+
+    (:split-reduce, :join-reduce, :split-combine, :join-combine)
+    (:workers (task/data task))))
+
+(def concurrent-reduce-task-unlock-factor
+  "This factor controls how quickly concurrent reduce tasks 'unlock' reductions
+  of later chunks. 8 means that each task unlocks roughly 8 later tasks."
+  8)
+
 (defn make-reduce-task
-  "Takes a task executor state, a fold, chunks, a chunk index. Returns
-  [state' task]: a new task to reduce that chunk."
-  [state {:keys [reducer-identity, reducer, post-reducer]} chunks i]
-  (task/submit state
-               [:reduce i]
-               (fn task [_]
-                 ; (info :reduce i)
-                 (post-reducer
-                   (reduce reducer
-                           (reducer-identity)
-                           (nth chunks i))))))
+  "Takes a task executor state, a fold, chunks, and a vector of
+  previously launched reduce tasks for this fold, and an index into the chunks
+  i. Returns [state' task]: a new task to reduce that chunk.
+
+  This is less speedy for single folds, but for multiple folds we actually want
+  to *defer* starting work until later--that way the later folds have a chance
+  to join and cancel our tasks. So even though we *could* rush ahead and launch
+  every reduce concurrently, we inject dependencies between reduce
+  tasks forming a tree: the first chunk unlocks the second and third, which
+  unlock the fourth through seventh, and so on."
+  [state {:keys [reducer-identity, reducer, post-reducer]} chunks
+   prev-reduce-tasks i]
+  (let [ordering-dep (when (seq prev-reduce-tasks)
+                       (nth prev-reduce-tasks
+                            (long (/ (count prev-reduce-tasks)
+                                     concurrent-reduce-task-unlock-factor))))]
+    (task/submit state
+                 [:reduce i]
+                 (when ordering-dep [ordering-dep])
+                 (fn task [_]
+                   ; (info :reduce i)
+                   (post-reducer
+                     (reduce reducer
+                             (reducer-identity)
+                             (nth chunks i)))))))
 
 (defn make-combine-task
   "Takes a task executor state, a fold, chunks, a chunk index, and either:
@@ -375,6 +407,7 @@
   [state name split-accs i acc-task]
   (task/submit state
                name
+               {:workers (task-workers acc-task)}
                [acc-task]
                (fn split [[acc]]
                  ; (info :split acc)
@@ -383,10 +416,13 @@
 (defn make-join-task
   "Takes a task executor state, a name, a function that joins two accumulator,
   and accumulator tasks a and b. Returns [state' task], where task returns the
-  two accumulators joined."
+  two accumulators joined. Join tasks keep a vector of :worker tasks they
+  depend on."
   [state name join-accs a-task b-task]
   (task/submit state
                name
+               {:workers (into (task-workers a-task)
+                               (task-workers b-task))}
                [a-task b-task]
                (fn join [[a b]]
                  ; (info :join a b)
@@ -395,21 +431,15 @@
 (defn task-work-pending?
   "We may have a join task which unifies work from two different reducers or
   combiners, or one which splits a reducer or combiner. If we cancel just the
-  join (split), the reducers (combiners) will still run. This takes a state, a
-  type of task (either :reduce or :combine), and a task, walks the dependency
-  tree, and figures out if all the actual work involved in this particular
+  join (split), the reducers (combiners) will still run. This takes a state and
+  a task and returns true if all the actual work involved in this particular
   chunk is still pending. You can also pass :cancelled as a task; this is
   always pending."
-  [state type task]
+  [state task]
   (or (identical? task :cancelled)
-      (and (task/pending? state task)
-           (or ; We're a real reduce/combine task doing work
-               (= type (first (task/name task)))
-               ; We're a join task
-               (every? (partial task-work-pending? state)
-                       (task/deps state task))))))
+      (every? (partial task/pending? state) (task-workers task))))
 
-(defn cancel-task-work-for-chunk
+(defn cancel-task-workers
   "Takes a state and a reduce, combine, split, or join task. Cancels not only
   this task, but all of its dependencies which actually perform the work for
   its particular chunk. Returns state'.
@@ -422,12 +452,7 @@
     ; Unknown, definitely not cancellable!
     nil (throw (ex-info {:type :impossible-cancellation
                          :task task}))
-    (case (first (task/name task))
-      (:reduce, :combine, :deliver)
-      (task/cancel state task)
-
-      (:split-reduce, :split-combine, :join-reduce, :join-combine)
-      (reduce cancel-task-work-for-chunk state (task/deps state task)))))
+    (reduce task/cancel state (task-workers task))))
 
 ; Pass construction
 (defn concurrent-pass
@@ -445,14 +470,15 @@
   [state {:keys [chunks fold deliver] :as pass}]
   (let [n (count chunks)]
     (assert (pos? n))
-    (info "Launching concurrent pass of" n "chunks")
+    ; (info "Launching concurrent pass of" n "chunks")
     (loop [i             0
            state         state
            reduce-tasks  []
            combine-tasks []]
       (if (< i n)
         ; Spawn tasks
-        (let [[state reduce-task]  (make-reduce-task state fold chunks i)
+        (let [[state reduce-task]
+              (make-reduce-task state fold chunks reduce-tasks i)
               [state combine-task]
               (if (= i 0)
                 (make-combine-task state fold chunks i reduce-task)
@@ -571,8 +597,8 @@
         _ (when-not (:name old-fold)
             (warn :malformed-old-fold
                   (with-out-str (pprint old-fold))))
-        _ (info :joining (:name old-fold) "with" (:name new-fold)
-                "over" n "chunks")
+        ;_ (info "Joining" (:name old-fold) "with" (:name new-fold)
+        ;        "over" n "chunks")
         old-reduce-task-ids  (:reduce-tasks old-pass)
         old-combine-task-ids (:combine-tasks old-pass)
         get-task          (fn get-task [task-id]
@@ -621,7 +647,7 @@
         ; Cancels a task in the mutable state. We also cancel all of the work
         ; for that chunk, in case it's a split/join task.
         cancel!           (fn cancel! [task]
-                            (vswap! vstate cancel-task-work-for-chunk task))
+                            (vswap! vstate cancel-task-workers task))
         ; When we cancel a combine, we need to mark every later combine as
         ; cancelled, and we don't want to repeat that work.
         combines-cancelled-i (volatile! n)
@@ -649,11 +675,11 @@
         ; split up fn?
         _ (when old-deliver-task (cancel! old-deliver-task))
 
-        _ (info (str "Original folds:\n"
-                     (print-join-plan n @vstate
-                                      old-reduce-tasks old-combine-tasks
-                                      reduce-tasks combine-tasks
-                                      new-reduce-tasks new-combine-tasks)))
+        ;_ (info (str "Original folds:\n"
+        ;             (print-join-plan n @vstate
+        ;                              old-reduce-tasks old-combine-tasks
+        ;                              reduce-tasks combine-tasks
+        ;                              new-reduce-tasks new-combine-tasks)))
         ;  old-reduce [.  R  . ]
         ; old-combine [C  C  C ]
         ;
@@ -687,14 +713,16 @@
               (let [old-rt (aget old-reduce-tasks i)]
                 (if (and (< last-missing-reduce-i i)
                          (< last-missing-combine-i (dec i))
-                         (task-work-pending? state :reduce old-rt))
+                         (task-work-pending? state old-rt))
                   (do ; Replace with a fused reduce
                       (cancel-old-reduce-task! i)
                       (aset reduce-tasks i
-                            (task! make-reduce-task fused chunks i)))
+                            (task! make-reduce-task fused chunks
+                                   (vec (remove nil? reduce-tasks)) i)))
                   ; We need to start a new reduce task instead.
                   (aset new-reduce-tasks i
-                        (task! make-reduce-task new-fold chunks i))))
+                        (task! make-reduce-task new-fold chunks
+                               (vec (remove nil? new-reduce-tasks)) i))))
               (recur (inc i))))
 
         ;_ (info (str "New reduce plan:\n"
@@ -807,7 +835,7 @@
                      (< last-missing-reduce-i 0)
                      (< last-missing-combine-i 0)
                      ; Can only cancel if work is pending
-                     (task-work-pending? state :combine old-ct)
+                     (task-work-pending? state old-ct)
                      ; And we need the reduce task
                      (when-let [rt (reduce-task! 0)]
                        ; We can replace this with an initial fused combine task
@@ -835,7 +863,7 @@
                          (< last-missing-reduce-i i)
                          (< last-missing-combine-i (dec i))
                          ; We need the old ct to be pending...
-                         (task-work-pending? state :combine old-ct)
+                         (task-work-pending? state old-ct)
                          ; We need both the current reduce task and the
                          ; previous combine task
                          (when-let [rt (reduce-task! i)]
@@ -896,15 +924,15 @@
                         (task/gc state' [deliver-task]))
 
             ; Log resulting plan
-            _ (info (str "Final join plan\n"
-                    (print-join-plan n
-                                     state'
-                                     old-reduce-tasks
-                                     old-combine-tasks
-                                     reduce-tasks
-                                     combine-tasks
-                                     new-reduce-tasks
-                                     new-combine-tasks)))
+            ;_ (info (str "Final join plan\n"
+            ;        (print-join-plan n
+            ;                         state'
+            ;                         old-reduce-tasks
+            ;                         old-combine-tasks
+            ;                         reduce-tasks
+            ;                         combine-tasks
+            ;                         new-reduce-tasks
+            ;                         new-combine-tasks)))
 
             ; Turn our tasks back into task IDs
             task-id (fn task-id [task]
@@ -1066,9 +1094,9 @@
                        state))))
       (swap! passes assoc :concurrent @resulting-pass))
     (let [pass @resulting-pass]
-      (if (:joined? pass)
-        (info "Joined!" (:name (:fold pass)))
-        (info "Didn't join!" (:name (:fold pass))))
+      ;(if (:joined? pass)
+      ;  (info "Joined!" (:name (:fold pass)))
+      ;  (info "Didn't join!" (:name (:fold pass))))
       (assoc pass :result result))))
 
 (defn fold

@@ -108,17 +108,15 @@
         _ (is (= :a @a))
         ; Even if we let b and c run, b and c should not have executed at all,
         ; but a should have started. and completed. D also runs to completion,
-        ; since it had no deps. Not sure how to do this without a sleep;
-        ; unfortunately this is fragile.
+        ; since it had no deps.
         _ (deliver bp true)
         _ (deliver cp true)
         _ (deliver dp true)
-        _ (Thread/sleep 10)
-        _ (is (= [[:start :a]
-                  [:start :d]
-                  [:end :a]
-                  [:end :d]]
-                 @log))
+        _ @a
+        _ @d
+        ; A and D may execute in either order
+        _ (is (= [[:end :a] [:end :d] [:start :a] [:start :d]]
+                 (sort @log)))
         ]))
 
 (deftest concurrent-test

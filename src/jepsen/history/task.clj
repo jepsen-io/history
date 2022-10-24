@@ -339,16 +339,6 @@
   [state ^Task task]
   (mapv (partial get-task state) (.dep-ids task)))
 
-(defn all-deps
-  "Returns an iterable of all deps of a task: a flat series of Tasks. Some may
-  be nil if they're no longer in the state."
-  [state ^Task task]
-  (let [deps (reify Function
-               (apply [_ task]
-                 (or (vals (deps task))
-                     [])))]
-    (Graphs/bfsVertices task deps)))
-
 (defn pending?
   "Takes a state and a task. Returns true iff that task is still pending
   execution, and can be safely cancelled."
@@ -357,24 +347,6 @@
         ^ISet          running   (.running-tasks state)]
     (and (not (.contains running task))
          (.contains ^ISet (.vertices dep-graph) task))))
-
-(defn all-deps-pending?
-  "Takes a state and a task. Walks that task's dependency graph, returning true
-  iff every dependency is pending."
-  [^State state, task]
-  (let [^DirectedGraph  dep-graph (.dep-graph state)
-        ^ISet           tasks     (.vertices dep-graph)
-        ^ISet           running   (.running-tasks state)
-        ; A Function which finds dependencies of a task
-        deps (reify Function
-               (apply [_ task]
-                 (or (deps task) [])))]
-    (loopr []
-           [t (Graphs/bfsVertices task deps)]
-           (and (not (.contains running t))
-                (.contains tasks t)
-                (recur))
-           true)))
 
 (defn state-done?
   "Returns true when a state has nothing ready, nothing running, and nothing in
@@ -478,6 +450,13 @@
   ([state name data deps f]
    (let [^State state' (submit* state name data deps f)]
      [state' (nth (.last ^IList (.effects state')) 1)])))
+
+(defn order-hint
+  "Ensures that the second task executes only after the first completes, or
+  This is not a logical dependency: the first task's results are not delivered
+  to the second, and the second task's dependencies remain unchanged."
+  [^State state, ^Task task]
+  )
 
 (defn finish
   "Takes a state and a task which has been executed, and marks it as completed.

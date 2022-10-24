@@ -25,7 +25,7 @@
   :jvm-opts ["-Xmx8g" "-server"
 ;             "-agentpath:/home/aphyr/yourkit/bin/linux-x86-64/libyjpagent.so=disablestacktelemetry,exceptions=disable,delay=10000,usedmem=50"
              ]
-  :test-selectors {:default (fn [m] (not (:perf m)))
+  :test-selectors {:default (fn [m] (not (or (:slow m) (:perf m))))
                    :all         (fn [m] true)
                    :focus       :focus
                    :slow        :slow

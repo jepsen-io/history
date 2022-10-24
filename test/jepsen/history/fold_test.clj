@@ -18,11 +18,14 @@
                                IList
                                IMap
                                List)
-             (java.io StringWriter)))
+           (java.io StringWriter)
+           (java.util ArrayList)))
 
 (def n
-  "How aggressive should tests be?"
-  1000)
+  "How aggressive should tests be? We always do at least this many trials. QC
+  scales up scaling factors to 200. Some of our tests are orders of magnitude
+  more expensive than others, so we scale many tests to N x 10 or whatever."
+  100)
 
 (defn reporter-fn
   "A reporter that pretty-prints failures, because oh my god these are so hard
@@ -30,13 +33,13 @@
   [{:keys [type] :as args}]
   (with-test-out
     (case type
-      :complete (println "Trials complete.")
+      :complete (do (prn) (info "Trials complete."))
       ; Don't need to see every trial
-      :trial nil
+      :trial (do (print ".") (flush))
       ; We want to know a failure occurred
-      :failure (println "Trial failed, shrinking...")
+      :failure (do (prn) (info "Trial failed, shrinking..."))
       ; Don't need to know about shrinking in detail
-      :shrink-step (print ".")
+      :shrink-step (do (print ".") (flush))
       ; Don't care about the original fail; show me the shrunk one
       :shrunk (do (println "\n\n# Shrunk result\n")
                   ;(pprint args)
@@ -71,15 +74,16 @@
 ; to behave when applied to a collection.
 (def fold-count
   "A fold which just counts elements."
-  {:name :count
-   :associative? true
-   :model count
-   :reducer-identity (constantly 0)
-   :reducer (fn [count dog] (+ count 1))
-   :post-reducer identity
+  {:name              :count
+   :associative?      true
+   :asap?             true
+   :model             (fn model [fold chunk-size dogs] (count dogs))
+   :reducer-identity  (constantly 0)
+   :reducer           (fn [count dog] (+ count 1))
+   :post-reducer      identity
    :combiner-identity (constantly 0)
-   :combiner +
-   :post-combiner identity})
+   :combiner          +
+   :post-combiner     identity})
 
 (def fold-count-gen
   "Generates a fold that counts elements."
@@ -94,26 +98,27 @@
   (let [red [:r name]
         postred [:pr name]
         comb  [:combine name]]
-    {:name         name
-     :associative? true
-     :model       (fn [_] name)
+    {:name              name
+     :associative?      true
+     :asap?             true
+     :model             (fn model [_ _ _] name)
      :reducer-identity (constantly red)
-     :reducer (fn reducer [acc _]
-                (assert (identical? acc red))
-                acc)
-     :post-reducer (fn post-reducer [acc]
-                     (assert+ (identical? acc red))
-                     postred)
+     :reducer           (fn reducer [acc _]
+                          (assert (identical? acc red))
+                          acc)
+     :post-reducer      (fn post-reducer [acc]
+                          (assert+ (identical? acc red))
+                          postred)
      :combiner-identity (constantly comb)
-     :combiner (fn combiner [acc reduced-acc]
-                 (assert+ (identical? acc comb))
-                 (assert+ (identical? reduced-acc postred)
-                         (str "Expected " (pr-str postred)
-                              ", got " (pr-str reduced-acc)))
-                 acc)
-     :post-combiner (fn post-combiner [acc]
-                      (assert (identical? acc comb))
-                      name)}))
+     :combiner          (fn combiner [acc reduced-acc]
+                          (assert+ (identical? acc comb))
+                          (assert+ (identical? reduced-acc postred)
+                                   (str "Expected " (pr-str postred)
+                                        ", got " (pr-str reduced-acc)))
+                          acc)
+     :post-combiner     (fn post-combiner [acc]
+                          (assert (identical? acc comb))
+                          name)}))
 
 (def fold-type-gen
   "Generates folds which ignore input and return name, checking type safety."
@@ -126,7 +131,8 @@
   "A fold designed to stress all the reduce/combine steps"
   {:name          :mean-cuteness
    :associative?  true
-   :model (fn [dogs]
+   :asap?            true
+   :model (fn [fold chunk-size dogs]
             (if (seq dogs)
               (/ (reduce + 0 (map :cuteness dogs))
                  (count dogs))
@@ -153,6 +159,75 @@
     (assoc fold-mean-cuteness
            :associative? assoc?)))
 
+(defn fold-call-count
+  "This fold ensures that each chunk is reduced exactly one time. It keeps an
+  atom :counts which is a map of :reducer-identity, :reducer, etc counts for
+  each function's invocations. The post-combiner result is the output of this
+  map.
+
+  There's no :model for this, because the naive reduce implementation and our
+  optimized executor do different things."
+  []
+  (let [counts (atom {:reducer-identity   0
+                      :reducer            0
+                      :post-reducer       0
+                      :combiner-identity  0
+                      :combiner           0
+                      :post-combiner      0})]
+    {:name              :call-count
+     :associative?      true
+     :asap?             true
+     :reducer-identity  (fn reducer-identity []
+                           (swap! counts update :reducer-identity inc)
+                           nil)
+     :reducer           (fn reducer [acc x]
+                          (swap! counts update :reducer inc)
+                          nil)
+     :post-reducer      (fn post-reducer [acc]
+                          (swap! counts update :post-reducer inc))
+     :combiner-identity  (fn combiner-identity []
+                           (swap! counts update :combiner-identity inc)
+                           nil)
+     :combiner           (fn combiner [acc x]
+                          (swap! counts update :combiner inc)
+                          nil)
+     :post-combiner      (fn post-combiner [acc]
+                          (swap! counts update :post-combiner inc)
+                          @counts)}))
+
+(def fold-call-count-gen
+  "Generates a fold which counts invocations."
+  (gen/let [assoc? (gen/elements [true false])]
+    (assoc (fold-call-count)
+           :associative? assoc?)))
+
+(def fold-mut-legs
+  "Trivial fold which returns a vector of leg counts, one for each dog. Uses
+  mutable ArrayLists without synchronization, to ensure that our memory
+  guarantees hold."
+  (let [id (fn identity [] (ArrayList.))]
+    {:name             :mut-legs
+     :associative?     true
+     :asap?            true
+     :model            (fn model [fold chunk-size dogs]
+                         (mapv    :legs dogs))
+     :reducer-identity id
+     :reducer          (fn reducer [^ArrayList l, dog]
+                         (.add  l (:legs dog))
+                         l)
+     :post-reducer      identity
+     :combiner-identity id
+     :combiner          (fn combiner [^ArrayList acc, ^ArrayList legs]
+                          (.addAll acc legs)
+                          acc)
+     :post-combiner     vec}))
+
+(def fold-mut-legs-gen
+  "Generates a mutable legs fold."
+  (gen/let [assoc? (gen/elements [true false])]
+    (assoc fold-mut-legs
+           :associative? assoc?)))
+
 (declare fold-gen)
 
 (defn fold-fuse-gen
@@ -163,16 +238,17 @@
             new-fold new-fold-gen]
     (assoc (:fused (f/fuse old-fold new-fold))
            :name [(:name old-fold) (:name new-fold)]
-           :model (fn [dogs]
-                    [((:model old-fold) dogs)
-                     ((:model new-fold) dogs)]))))
+           :model (fn model [fold chunk-size dogs]
+                    [((:model old-fold) fold chunk-size dogs)
+                     ((:model new-fold) fold chunk-size dogs)]))))
 
 (def basic-fold-gen
   "Makes a random, basic fold over dogs"
   (gen/one-of
     [fold-type-gen
      fold-count-gen
-     fold-mean-cuteness-gen]))
+     fold-mean-cuteness-gen
+     fold-mut-legs-gen]))
 
 (def fold-gen
   "Makes a (possibly recursively fused) fold over dogs."
@@ -364,12 +440,10 @@
       (results/result-data (first (remove results/pass? results))))))
 
 (defn will-run?
-  "Will a task eventually complete? Either it already ran, or its in the state,
-  *and* all its deps will complete."
+  "Will a task eventually complete? Either it already ran, or its in the state."
   [state task]
   (or (t/ran? task)
-      (and (t/has-task? state task)
-           (every? (partial will-run? state) (t/deps task)))))
+      (t/has-task? state task)))
 
 (defn could-run?
   "Either it already ran or it's in the state."
@@ -385,18 +459,6 @@
       (or (= type :combine)
           (= type :reduce)))))
 
-(defn actual-workers
-  "Returns a collection of all tasks which are actual workers for this
-  particular chunk in a given task. Traverses split/join dependencies."
-  [task]
-  (if (nil? task)
-    #{}
-    (let [type (first (t/name task))]
-      (case type
-        (:combine :reduce) #{task}
-        (:split-combine :split-reduce :join-combine :join-reduce)
-        (into #{} (mapcat actual-workers (t/deps task)))))))
-
 (defn join-concurrent-pass-result*
   "Checks to see if a concurrent pass join is OK, with early return"
   [chunks state0 state state' old-pass new-pass pass return!]
@@ -411,6 +473,7 @@
         reduce-tasks       (mapv get-task (:reduce-tasks pass))
         new-combine-tasks  (mapv get-task (:new-combine-tasks pass))
         new-reduce-tasks   (mapv get-task (:new-reduce-tasks pass))
+        deliver-task       (get-task (:deliver-task pass))
 
         ; Should be concurrent
         _ (when (not= :concurrent (:type pass))
@@ -421,8 +484,8 @@
             (return! (err :no-final-combine combine-tasks)))
 
         ; Which must complete in the new state
-        _ (when-not (will-run? state' (peek combine-tasks))
-            (return! (err :won't-complete (peek combine-tasks))))
+        _ (when-not (will-run? state' deliver-task)
+            (return! (err :won't-complete deliver-task)))
 
         ; If you gave up, fine
         _ (when-not (:joined? pass)
@@ -447,10 +510,11 @@
                   effects? (fn effects?
                              ([task] (effects? task #{}))
                              ([task besides]
-                              (->> (actual-workers task)
-                                   (remove besides)
-                                   (filter (partial could-run? state'))
-                                   seq)))
+                              (when task
+                                (->> (f/task-workers task)
+                                     (remove besides)
+                                     (filter (partial could-run? state'))
+                                     seq))))
                   _ (if (and (worker? rt) (could-run? state' rt))
                       ; We have an actual worker for the new reduce task. Old
                       ; and new reduce tasks must be side-effect free (besides
@@ -556,14 +620,12 @@
                (map (fn [step]
                       (let [pass   (:new-pass step)
                             result (:result pass)]
-                        (prn :result result)
+                        ; (prn :result result)
                         (if (realized? result)
                           (passing-result)
                           (err :nontermination result))))))]
       (all-results (concat pass-results term-results)))))
 
-; We try to verify that concurrent pass join plans, you know, make *sense*
-;
 ; Cheat sheet for REPL work here:
 #_ (do
     (require '[clojure.test.check [generators :as gen] [results :as res]])
@@ -581,14 +643,16 @@
     (-> qc :shrunk :smallest first ft/join-concurrent-passes-result res/result-data pprint)
     )
 
-(defspec join-concurrent-passes-spec {:num-tests n
+; We try to verify that concurrent pass join plans, you know, make *sense*
+; without actually executing them.
+(defspec join-concurrent-passes-spec {:num-tests (* n 10)
                                       ;:seed 1666379400858
                                       }
   (prop/for-all [inputs join-concurrent-passes-inputs-gen]
-                (prn)
-                (prn)
-                (println "# RUN " inputs)
-                (prn)
+                ;(prn)
+                ;(prn)
+                ;(println "# RUN " inputs)
+                ;(prn)
                 (join-concurrent-passes-result inputs)))
 
 (defn apply-fold-with-reduce
@@ -611,29 +675,6 @@
         ]
     post-combined))
 
-(defspec fold-equiv-serial n
-  (prop/for-all [dogs       dogs-gen
-                 chunk-size small-pos-int
-                 fold       fold-gen]
-                (let [stdout     (StringWriter.)]
-                  (binding [;*out* stdout
-                            ;*err* stdout
-                            ]
-                    (let [executor   (f/executor (hc/chunked chunk-size dogs))
-                          model-res  ((:model fold) dogs)
-                          reduce-res (apply-fold-with-reduce fold dogs)
-                          exec-res   (f/fold executor fold)]
-                      (reify Result
-                        (pass? [_]
-                          (= model-res reduce-res exec-res))
-
-                        (result-data [_]
-                          {:fold   (:name fold)
-                           :model  model-res
-                           :reduce reduce-res
-                           :exec   exec-res
-                           :log    (str stdout)})))))))
-
 (defn secs
   "Nanos to seconds"
   [nanos]
@@ -641,18 +682,19 @@
 
 (defn test-fold
   "Runs fold on executor, returning a test.check Result"
-  [executor dogs fold]
+  [executor chunk-size dogs fold]
   (let [t0 (System/nanoTime)
         exec-res   (f/fold executor fold)
         t1 (System/nanoTime)
-        model-res  ((:model fold) dogs)
+        model-res  ((:model fold) fold chunk-size dogs)
         t2 (System/nanoTime)
         reduce-res (apply-fold-with-reduce fold dogs)
         t3 (System/nanoTime)]
-    (info "Tested fold" (:name fold)
-          "- exec"  (secs (- t1 t0))
-          " reduce" (secs (- t3 t2))
-          " model"  (secs (- t2 t1)))
+    ;(info "Tested fold" (:name fold) "over" (count dogs) "dogs in"
+    ;      (long (Math/ceil (/ (count dogs) chunk-size))) "chunks:"
+    ;      "exec"  (secs (- t1 t0))
+    ;      "reduce" (secs (- t3 t2))
+    ;      "model"  (secs (- t2 t1)))
     (reify Result
       (pass? [_]
         (= model-res reduce-res exec-res))
@@ -663,6 +705,20 @@
          :reduce reduce-res
          :exec   exec-res}))))
 
+; Runs folds one at a time.
+(defspec fold-equiv-serial (* n 10)
+  (prop/for-all [dogs       dogs-gen
+                 chunk-size (gen/scale (fn [size]
+                                         (inc (/ size 10)))
+                                         small-pos-int)
+                 fold       fold-gen]
+                (let [stdout     (StringWriter.)]
+                  (binding [;*out* stdout
+                            ;*err* stdout
+                            ]
+                    (let [executor   (f/executor (hc/chunked chunk-size dogs))]
+                      (test-fold executor chunk-size dogs fold))))))
+
 ; Submits a bunch of folds at the same time to a single executor. Stress-tests
 ; all the concurrency safety!
 (defspec fold-equiv-parallel n
@@ -670,38 +726,73 @@
                  chunk-size (gen/scale (fn [size]
                                          (inc (/ size 10)))
                                          small-pos-int)
-                 ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
                  folds      (gen/vector basic-fold-gen)]
                 ; Just for now, cuz all I implemented was concurrent folds
                 (let [folds (mapv #(assoc % :associative? true) folds)]
-                  (info "parallel dogs" (count dogs) "chunk-size" chunk-size
-                        "folds" (mapv :name folds))
+                  ;(info "parallel dogs" (count dogs) "chunk-size" chunk-size
+                  ;      "folds" (mapv :name folds))
                   (let [executor (f/executor (hc/chunked chunk-size dogs))
-                        results  (real-pmap (partial test-fold executor dogs)
-                                            folds)]
+                        results  (real-pmap
+                                   (partial test-fold executor chunk-size dogs)
+                                   folds)]
                     (all-results results)))))
 
 ; LORGE DATA. This one still tests safety and compares results to the models.
 (defspec ^:slow fold-equiv-parallel-lorge n
   (let [dog-count 100000000]
     (prop/for-all [dogs       (gen/not-empty dogs-gen)
-                   ; folds    (gen/vector (slow-fold-gen basic-fold-gen))
                    folds      (gen/not-empty (gen/vector basic-fold-gen))]
                   ; Just for now, cuz all I implemented was concurrent folds
                   (let [folds (mapv #(assoc % :associative? true) folds)
                         dogs  (vec (take dog-count (cycle dogs)))
                         chunk-size (long (/ (count dogs) 64))]
-                    (info "parallel dogs" (count dogs) "chunk-size" chunk-size
-                          "folds" (mapv :name folds))
+                    ; (info "parallel dogs" (count dogs) "chunk-size" chunk-size
+                    ;      "folds" (mapv :name folds))
                     (let [executor (f/executor (hc/chunked chunk-size dogs))
-                          results  (real-pmap (partial test-fold executor dogs)
-                                              folds)]
+                          results  (real-pmap (partial test-fold executor
+                                                       chunk-size dogs)
+                                     folds)]
                       (all-results results))))))
 
+; Checks call counts more rigorously to make sure we aren't multiply invoking
+; reducers on a chunk.
+(defspec call-count-spec n
+  (prop/for-all
+    [dogs       dogs-gen
+     chunk-size (gen/scale (fn [size]
+                             (inc (/ size 10)))
+                           small-pos-int)
+     folds      (gen/vector fold-call-count-gen)]
+    (let [executor (f/executor (hc/chunked chunk-size dogs))
+          n        (count dogs)
+          results  (real-pmap (partial f/fold executor) folds)]
+      (all-results
+        (map (fn [fold {:keys [reducer-identity reducer post-reducer
+                               combiner-identity combiner post-combiner]
+                        :as result}]
+               (let [c (if (:associative? fold)
+                         (long (Math/ceil (/ n chunk-size)))
+                         1)]
+                 (reify Result
+                   (pass? [_]
+                     ; If no elements, we don't even need to reduce chunks
+                     (and (= reducer-identity (min n c))
+                          (= reducer n)
+                          (= post-reducer (min n c))
+                          (= combiner-identity 1)
+                          (= combiner (min n c))
+                          (= post-combiner 1)))
+                   (result-data [_]
+                     (assoc result
+                            :n n
+                            :c c
+                            :folds (mapv :name folds))))))
+             folds
+             results)))))
 
 ; This one's *just* for perf testing. Spews JSON to a file then folds over it as if it were tons of files.
 (deftest ^:perf fold-parallel-perf
-  ; a billion dogs might be enough -- nona, probably
+  ; ten million dogs might be enough -- nona, probably
   (let [dog-count   1e7
         chunk-count 100
         dogs-per-file (Math/ceil (/ dog-count chunk-count))
