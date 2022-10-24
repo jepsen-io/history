@@ -12,7 +12,7 @@
 
     (def pet (task/submit! e :pet-dog (fn [_] :petting-dog)))
 
-  Tasks are de-refable with the standard blocking and nonblocking calls.
+  Tasks are derefable with the standard blocking and nonblocking calls.
   Derefing a task returns its output. You can ask completion with `realized?`
 
     @pet             ; :petting-dog
@@ -57,8 +57,7 @@
                          :adopted!)))
     ; Adopt pauses, waiting on dog, which in turn is waiting on our
     ; dog-promise.
-    (realized? adopt-task) ; false
-
+    (realized? adopt-task)    ; false
     (task/dep-ids adopt-task) ; [5 4]
 
     ;Person completed immediately:
@@ -231,7 +230,10 @@
            (= id (.id ^Task other)))))
 
   (toString [this]
-    (str "(Task " name " " id ")")))
+    (str "(Task " id " " (pr-str name)
+         (when data (str " " (pr-str data)))
+         (when (< 0 (alength dep-ids)) (str " " (pr-str (vec dep-ids))))
+         ")")))
 
 (defn pseudotask
   "One of the weird tricks we use (programmers HATE him!) is to abuse the
@@ -473,7 +475,7 @@
    (submit state name nil nil f))
   ([state name deps f]
    (submit state name nil deps f))
-  ([state name deps data f]
+  ([state name data deps f]
    (let [^State state' (submit* state name data deps f)]
      [state' (nth (.last ^IList (.effects state')) 1)])))
 
@@ -638,11 +640,11 @@
     (.poll this Long/MAX_VALUE TimeUnit/NANOSECONDS))
 
   (offer [this task]
-    ; skskskskksks
     (try (.lock lock)
          (.signal not-empty)
          (finally
            (.unlock lock)))
+    ; library author: does something psychotic
     true))
 
 (defn state-queue

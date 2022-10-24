@@ -102,12 +102,14 @@
                 (assert (identical? acc red))
                 acc)
      :post-reducer (fn post-reducer [acc]
-                     (assert (identical? acc red))
+                     (assert+ (identical? acc red))
                      postred)
      :combiner-identity (constantly comb)
      :combiner (fn combiner [acc reduced-acc]
-                 (assert (identical? acc comb))
-                 (assert (identical? reduced-acc postred))
+                 (assert+ (identical? acc comb))
+                 (assert+ (identical? reduced-acc postred)
+                         (str "Expected " (pr-str postred)
+                              ", got " (pr-str reduced-acc)))
                  acc)
      :post-combiner (fn post-combiner [acc]
                       (assert (identical? acc comb))
@@ -680,7 +682,7 @@
                     (all-results results)))))
 
 ; LORGE DATA. This one still tests safety and compares results to the models.
-(defspec ^:perf fold-equiv-parallel-lorge n
+(defspec ^:slow fold-equiv-parallel-lorge n
   (let [dog-count 100000000]
     (prop/for-all [dogs       (gen/not-empty dogs-gen)
                    ; folds    (gen/vector (slow-fold-gen basic-fold-gen))

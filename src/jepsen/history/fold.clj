@@ -318,8 +318,8 @@
   [state {:keys [reducer-identity, reducer, post-reducer]} chunks i]
   (task/submit state
                [:reduce i]
-               nil
                (fn task [_]
+                 ; (info :reduce i)
                  (post-reducer
                    (reduce reducer
                            (reducer-identity)
@@ -333,24 +333,25 @@
 
   Returns [state' task]: a task which combines that chunk with earlier
   combines."
-  ([state {:keys [combiner-identity combiner]}
-    chunks i reduce-task]
+  ([state {:keys [combiner-identity combiner]} chunks i reduce-task]
    (let [n (count chunks)]
      (task/submit state
                   [:combine i]
                   [reduce-task]
-                  (fn first-task [inputs]
-                    (let [res (combiner (combiner-identity) @reduce-task)]
+                  (fn first-task [[post-reduced]]
+                    ; (info :first-combine i post-reduced)
+                    (let [res (combiner (combiner-identity) post-reduced)]
                       ;(info :combine i res)
                       res)))))
-  ([state {:keys [combiner post-combiner]}
-    chunks i prev-combine-task reduce-task]
+  ([state {:keys [combiner post-combiner]} chunks i
+    prev-combine-task reduce-task]
    (let [n (count chunks)]
      (task/submit state
                   [:combine i]
-                  [reduce-task prev-combine-task]
-                  (fn task [_]
-                    (let [res (combiner @prev-combine-task @reduce-task)]
+                  [prev-combine-task reduce-task]
+                  (fn task [[prev-combine post-reduced]]
+                    ; (info :combine i prev-combine post-reduced)
+                    (let [res (combiner prev-combine post-reduced)]
                       ;(info :combine i res)
                       res))))))
 
@@ -362,8 +363,9 @@
   (task/submit state
                [:deliver]
                [task]
-               (fn deliver [_]
-                 (deliver-fn (post-combiner @task)))))
+               (fn deliver [[combined]]
+                 ; (info :deliver combined)
+                 (deliver-fn (post-combiner combined)))))
 
 (defn make-split-task
   "Takes a task executor state, a name, a function that splits an accumulator,
@@ -374,8 +376,9 @@
   (task/submit state
                name
                [acc-task]
-               (fn split [_]
-                 (nth (split-accs @acc-task) i))))
+               (fn split [[acc]]
+                 ; (info :split acc)
+                 (nth (split-accs acc) i))))
 
 (defn make-join-task
   "Takes a task executor state, a name, a function that joins two accumulator,
@@ -385,43 +388,26 @@
   (task/submit state
                name
                [a-task b-task]
-               (fn join [_]
-                 ; TODO: all of these retain memory by retaining refs to
-                 ; prior tasks--if we figure out how not to do that, replace
-                 ; this with task IDs and getting from fn inputs.
-                 (join-accs @a-task @b-task))))
+               (fn join [[a b]]
+                 ; (info :join a b)
+                 (join-accs a b))))
 
-(defn reduce-task-work-pending?
-  "We may have a join task which unifies work from two different reducers. If
-  we cancel just the join, the reducers will still run. This takes a state and
-  a reduce task, walks the dependency tree, and figures out if all the actual
-  work involved in this particular chunk is still pending. You can also pass
-  :cancelled as a task; this is always pending."
-  [state task]
+(defn task-work-pending?
+  "We may have a join task which unifies work from two different reducers or
+  combiners, or one which splits a reducer or combiner. If we cancel just the
+  join (split), the reducers (combiners) will still run. This takes a state, a
+  type of task (either :reduce or :combine), and a task, walks the dependency
+  tree, and figures out if all the actual work involved in this particular
+  chunk is still pending. You can also pass :cancelled as a task; this is
+  always pending."
+  [state type task]
   (or (identical? task :cancelled)
       (and (task/pending? state task)
-           (or ; We're a real combine task doing work
-               (:reduce (first (task/name task)))
+           (or ; We're a real reduce/combine task doing work
+               (= type (first (task/name task)))
                ; We're a join task
-               (every? (partial reduce-task-work-pending? state)
-                       (task/deps task))))))
-
-(defn combine-task-work-pending?
-  "We may have a combine task which joins work from multiple combine tasks. If
-  we cancel just the join, the combines will still run. This takes a state and
-  a combine task, and returns true if all the actual work for this particular
-  combine chunk is actually pending. Note that we take advantage of combine
-  tasks' dependency order: the previous combine task is always the second
-  dependency. You can also pass :cancelled as a task; this is always pending."
-  [state task]
-  ;(info :task task :pending (task/pending? state task) :combine? (
-  (or (identical? task :cancelled)
-      (and (task/pending? state task)
-           (or ; We're a real combine task doing work
-               (= :combine (first (task/name task)))
-               ; We're a join task
-               (every? (partial combine-task-work-pending? state)
-                       (task/deps task))))))
+               (every? (partial task-work-pending? state)
+                       (task/deps state task))))))
 
 (defn cancel-task-work-for-chunk
   "Takes a state and a reduce, combine, split, or join task. Cancels not only
@@ -430,14 +416,18 @@
 
   A task of :cancelled yields no changes."
   [state task]
-  (if (identical? task :cancelled)
-    state
+  (condp identical? task
+    ; Already cancelled
+    :cancelled state
+    ; Unknown, definitely not cancellable!
+    nil (throw (ex-info {:type :impossible-cancellation
+                         :task task}))
     (case (first (task/name task))
       (:reduce, :combine, :deliver)
       (task/cancel state task)
 
       (:split-reduce, :split-combine, :join-reduce, :join-combine)
-      (reduce cancel-task-work-for-chunk state (task/deps task)))))
+      (reduce cancel-task-work-for-chunk state (task/deps state task)))))
 
 ; Pass construction
 (defn concurrent-pass
@@ -455,6 +445,7 @@
   [state {:keys [chunks fold deliver] :as pass}]
   (let [n (count chunks)]
     (assert (pos? n))
+    (info "Launching concurrent pass of" n "chunks")
     (loop [i             0
            state         state
            reduce-tasks  []
@@ -696,7 +687,7 @@
               (let [old-rt (aget old-reduce-tasks i)]
                 (if (and (< last-missing-reduce-i i)
                          (< last-missing-combine-i (dec i))
-                         (reduce-task-work-pending? state old-rt))
+                         (task-work-pending? state :reduce old-rt))
                   (do ; Replace with a fused reduce
                       (cancel-old-reduce-task! i)
                       (aset reduce-tasks i
@@ -816,7 +807,7 @@
                      (< last-missing-reduce-i 0)
                      (< last-missing-combine-i 0)
                      ; Can only cancel if work is pending
-                     (combine-task-work-pending? state old-ct)
+                     (task-work-pending? state :combine old-ct)
                      ; And we need the reduce task
                      (when-let [rt (reduce-task! 0)]
                        ; We can replace this with an initial fused combine task
@@ -844,7 +835,7 @@
                          (< last-missing-reduce-i i)
                          (< last-missing-combine-i (dec i))
                          ; We need the old ct to be pending...
-                         (combine-task-work-pending? state old-ct)
+                         (task-work-pending? state :combine old-ct)
                          ; We need both the current reduce task and the
                          ; previous combine task
                          (when-let [rt (reduce-task! i)]
@@ -987,7 +978,6 @@
         chunks  (hc/chunks history)
         ; First reduction task
         r0 (task/submit! exec [:reduce 0]
-                         []
                          (fn first-reduce [_]
                            (reduce
                              reducer
@@ -1006,9 +996,8 @@
                                      [:reduce i]
                                      ; Depends only on the previous reduce
                                      [prev-reduce]
-                                     (fn reduce-task [inputs]
-                                       (let [acc (get inputs prev-reduce-id)]
-                                         (reduce reducer acc chunk))))]
+                                     (fn reduce-task [[acc]]
+                                       (reduce reducer acc chunk)))]
                  (recur (conj reduces r)
                         (inc i)))
                reduces)
@@ -1018,9 +1007,8 @@
         pr (task/submit! exec
                          :post-reduce
                          [last-reduce]
-                         (fn post-reduce [inputs]
-                           (let [acc (get inputs last-reduce-id)]
-                             (post-reducer acc))))
+                         (fn post-reduce [[acc]]
+                           (post-reducer acc)))
         ; Combine
         combine (if (and (identical? reducer-identity
                                       combiner-identity)
@@ -1031,17 +1019,16 @@
                    (task/submit! exec
                                  :single-combine
                                  [pr]
-                                 (fn single-combine [inputs]
+                                 (fn single-combine [[post-reduced]]
                                    (combiner
                                      (combiner-identity)
-                                     (get inputs (task/id pr))))))
-        ; post-combine
+                                     post-reduced))))
+        ; Post-combine
         post-combine (task/submit! exec
                                    :post-combine
                                    [combine]
-                                   (fn post-combine [inputs]
-                                     (post-combiner
-                                       (get inputs (task/id combine)))))]
+                                   (fn post-combine [[combined]]
+                                     (post-combiner combined)))]
     {:type         :linear
      :post-reduce  pr
      :reduces      reduces
