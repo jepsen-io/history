@@ -460,20 +460,30 @@
 
 ; Tasks which work for both linear and concurrent folds
 
+(declare clear-old-passes!)
+
 (defn make-deliver-task
   "Takes a task executor state, a final combine task, and a function which
   delivers results to the output of a fold. Returns [state' task], where task
-  applies the post-combiner of the fold and calls deliver-fn with the results"
-  [state {:keys [post-combiner]} task deliver-fn]
-  (task/submit state
-               [:deliver]
-               [task]
-               (fn deliver [[combined]]
-                 (try
-                   ; (info :deliver combined)
-                   (deliver-fn (post-combiner combined))
-                   (catch Throwable t
-                     (deliver-fn t))))))
+  applies the post-combiner of the fold and calls deliver-fn with the results.
+
+  Can also take an optional fold Executor; we clean up old passes automatically
+  once delivery occurs."
+  ([state fold task deliver-fn]
+   (make-deliver-task state fold task deliver-fn nil))
+  ([state {:keys [post-combiner]} task deliver-fn executor]
+   (task/submit state
+                [:deliver]
+                [task]
+                (fn deliver [[combined]]
+                  (try
+                    ; (info :deliver combined)
+                    (deliver-fn (post-combiner combined))
+                    (try (when executor (clear-old-passes! executor))
+                         (catch RuntimeException t
+                           (warn t "Couldn't clear old passes!")))
+                    (catch Throwable t
+                      (deliver-fn t)))))))
 
 (defn split-deliver-fn
   "Takes an old and new pass. Constructs a function which takes an [old-res
@@ -646,7 +656,8 @@
         (let [[state combine-task]
               (make-linear-combine-task state fold chunks (peek reduce-tasks))
               [state deliver-task]
-              (make-deliver-task state fold combine-task deliver)
+              (make-deliver-task state fold combine-task deliver
+                                 (:executor pass))
               pass (assoc pass
                           :reduce-tasks (mapv task/id reduce-tasks)
                           :combine-task (task/id combine-task)
@@ -681,7 +692,7 @@
         ; Done!
         (let [[state deliver-task]
               (make-deliver-task state fold (nth combine-tasks (dec n))
-                                 deliver)]
+                                 deliver (:executor pass))]
           [state
            (assoc pass
                   :reduce-tasks  (mapv task/id reduce-tasks)
@@ -814,7 +825,8 @@
             ; And deliver task
             deliver-fn (split-deliver-fn old-pass new-pass)
             [state deliver-task]
-            (make-deliver-task state fused combine-task deliver-fn)]
+            (make-deliver-task state fused combine-task deliver-fn
+                               (:executor old-pass))]
         ;(info (str "Joined passes:\n"
         ;           (pass-str state
         ;                     [[:old-reduce old-reduce-tasks]
@@ -825,6 +837,7 @@
           :joined?      true
           :fold         fused
           :chunks       chunks
+          :executor     (:executor old-pass)
           :reduce-tasks (mapv maybe-task-id reduce-tasks)
           :combine-task (maybe-task-id combine-task)
           :deliver-task (maybe-task-id deliver-task)
@@ -932,7 +945,7 @@
         ; split up fn?
         _ (when old-deliver-task (cancel! old-deliver-task))
 
-        _ (info (str "Original pass:\n" (pass-str @vstate old-pass)))
+        ;_ (info (str "Original pass:\n" (pass-str @vstate old-pass)))
         ;  old-reduce [.  R  . ]
         ; old-combine [C  C  C ]
         ;
@@ -1147,22 +1160,24 @@
             deliver-fn (split-deliver-fn old-pass new-pass)
             state' @vstate
             [state' deliver-task]
-            (make-deliver-task state' fused combine-task deliver-fn)]
+            (make-deliver-task state' fused combine-task deliver-fn
+                               (:executor old-pass))]
         ; Log resulting plan
-        (info (str "Final join plan\n"
-                   (pass-str state'
-                             [[:old-reduce old-reduce-tasks]
-                              [:old-combine old-combine-tasks]
-                              [:reduce reduce-tasks]
-                              [:combine combine-tasks]
-                              [:new-combine new-combine-tasks]
-                              [:new-reduce new-reduce-tasks]])))
+        ;(info (str "Final join plan\n"
+        ;           (pass-str state'
+        ;                     [[:old-reduce old-reduce-tasks]
+        ;                      [:old-combine old-combine-tasks]
+        ;                      [:reduce reduce-tasks]
+        ;                      [:combine combine-tasks]
+        ;                      [:new-combine new-combine-tasks]
+        ;                      [:new-reduce new-reduce-tasks]])))
         ; And construct our new pass.
         [state'
          {:type          :concurrent
           :joined?       true
           :fold          fused
           :chunks        chunks
+          :executor      (:executor old-pass)
           :reduce-tasks  (mapv maybe-task-id reduce-tasks)
           :combine-tasks (mapv maybe-task-id combine-tasks)
           ; We don't actually need these for execution, but they're helpful for
@@ -1200,25 +1215,25 @@
   "Takes an Executor and clears out any old pass state."
   [^Executor e]
   (let [task-executor (.task-executor e)]
-    (swap! @(.passes e)
+    (swap! (.passes e)
            (fn clear [passes]
              (let [state (task/executor-state task-executor)]
+               ;(info :passes (with-out-str (pprint passes)))
                (loopr [passes' passes]
                       [[type pass] passes]
-                      (recur (case type
-                               :concurrent
-                               (if (->> (:combine-tasks pass)
-                                        (task/get-task state)
-                                        (task/pending? state))
-                                 passes
-                                 (assoc passes type nil))
-
-                               :linear
-                               (if (->> (:reduce-tasks pass)
-                                        (task/get-task state)
-                                        (task/pending? state))
-                                 passes
-                                 (assoc passes type nil))))))))))
+                      ; Figure out if pass is joinable
+                      (let [task-id (peek (get pass
+                                               (case type
+                                                 :concurrent :combine-tasks
+                                                 :linear     :reduce-tasks)))]
+                        (recur
+                          (if (or (nil? task-id)
+                                  (let [task (task/get-task state task-id)]
+                                    (not (task/pending? state task-id))))
+                            (dissoc passes' type)
+                            passes')))
+                      (do ;(info :cleared-passes (with-out-str (pprint passes')))
+                          passes')))))))
 
 (defn executor-pass
   "Takes a history executor and a fold. Turns the fold into a pass, ready for
@@ -1226,8 +1241,10 @@
   [^Executor e fold]
   (let [exec    (.task-executor e)
         history (.history e)
-        chunks  (hc/chunks history)]
-  (pass fold chunks)))
+        chunks  (hc/chunks history)
+        pass    (pass fold chunks)]
+    ; We'll want this so we can clear old pass state later.
+    (assoc pass :executor e)))
 
 (defn run-pass!
   "Takes a history executor and a pass. Launches the pass on the executor,
