@@ -118,7 +118,10 @@
   (:refer-clojure :exclude [name])
   (:require [clojure [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn fatal]]
-            [dom-top.core :refer [assert+ loopr]])
+            [dom-top.core :refer [assert+ loopr]]
+            [potemkin :refer [def-abstract-type
+                              definterface+
+                              deftype+]])
   (:import (clojure.lang IDeref
                          IBlockingDeref
                          IPending)
@@ -145,36 +148,72 @@
                                        ReentrantLock)
            (java.util.function Function)))
 
+; Machinery for error propagation--maybe come back to this once I have a better
+; handle on how errors should work
+(defrecord CapturedThrow [throwable])
+
+(defmacro capture-throw
+  "Evaluates body in a try, capturing any exception thrown and returning it
+  in a CapturedThrowable box. Helpful for error propagation."
+  [& body]
+  `(try
+    ~@body
+    (catch Throwable t
+      (CapturedThrowable. t))))
+
+(defn captured-throw?
+  "Is something a captured throwable?"
+  [x]
+  (instance? CapturedThrow x))
+
+(defn throw-captured
+  "Rethrows a captured throwable."
+  [^CapturedThrow x]
+  (if (instance? CapturedThrow x)
+    (throw (.throwable x))
+    x))
+
+; Tasks
+
 (declare finish-task!)
 
-; Represents low-level tasks. For speed, we hash and compare equality strictly
-; by ID. Tasks should not be compared across different executors!
-(deftype Task
-  [; This task's ID
-   ^long id
-   ; A friendly name for this task
-   name
-   ; Arbitrary metadata you might like to provide with a task
-   data
-   ; An array of task IDs we depend on
-   dep-ids
-   ; A function which takes a map of task IDs (our dependencies) to their
-   ; results, and produces a result
-   f
-   ; An array of input promises from our dependencies. We clear this as soon as
-   ; the task begins to avoid retaining memory.
-   ^{:tag "[Ljava.lang.Object;", :unsynchronized-mutable true} inputs
-   ; The promise we should deliver our own result to
-   ^IDeref output
-   ; The executor we should update when we complete
-   executor]
+(definterface+ ITask
+  (^long id [task]
+      "Returns the ID of a task.")
+
+  (name [task]
+        "Returns the name of a task.")
+
+  (data [task]
+        "Returns the custom data associated with a task.")
+
+  (dep-ids [task]
+    "Returns a vector of dependency IDs of a task.")
+
+  (ran? [task]
+        "Returns true iff a task ran already."))
+
+; Functions we don't really want in the public API
+(definterface InternalTask
+  (output []))
+
+; Common methods between our two task types
+(def-abstract-type ATask
+  ITask
+  (id      [_] id)
+  (name    [_] name)
+  (data    [_] data)
+  (ran?    [_] (realized? output))
+
+  InternalTask
+  (output  [_] output)
 
   clojure.lang.IDeref
   (deref [this]
-    (let [out @output]
-      (if (instance? Throwable out)
-        (throw out)
-        out)))
+         (let [out @output]
+           (if (instance? Throwable out)
+             (throw out)
+             out)))
 
   clojure.lang.IBlockingDeref
   (deref [this ms timeout-value]
@@ -186,6 +225,41 @@
   clojure.lang.IPending
   (isRealized [this]
     (.isRealized ^IPending output))
+
+  Object
+  (hashCode [this]
+    (hash id))
+
+  (equals [this other]
+    (or (identical? this other)
+      (and (instance? Task other)
+           (= id (.id ^Task other))))))
+
+; Represents low-level tasks. For speed, we hash and compare equality strictly
+; by ID. Tasks should not be compared across different executors!
+(deftype+ Task
+  [; This task's ID
+   ^long id
+   ; A friendly name for this task
+   name
+   ; Arbitrary metadata you might like to provide with a task
+   data
+   ; An array of task IDs we depend on
+   ^longs dep-ids
+   ; A function which takes a map of task IDs (our dependencies) to their
+   ; results, and produces a result
+   f
+   ; An array of input promises from our dependencies. We clear this as soon as
+   ; the task begins to avoid retaining memory.
+   ^{:tag "[Ljava.lang.Object;", :unsynchronized-mutable true} inputs
+   ; The promise we should deliver our own result to
+   ^IDeref output
+   ; The executor we should update when we complete
+   executor]
+  ATask
+
+  ITask
+  (dep-ids [_] (vec dep-ids))
 
   Runnable
   (run [this]
@@ -220,21 +294,56 @@
              (catch Throwable t
                (fatal t "Error finishing task!" this))))))
 
-  Object
-  (hashCode [this]
-    (hash id))
-
-  (equals [this other]
-    (or (identical? this other)
-      (and (instance? Task other)
-           (= id (.id ^Task other)))))
-
   (toString [this]
     (str "(Task " id " " (pr-str name)
          (when data (str " " (pr-str data)))
-         (when (< 0 (alength ^objects dep-ids))
+         (when (< 0 (alength ^longs dep-ids))
            (str " " (pr-str (vec dep-ids))))
          ")")))
+
+(deftype+ Catch
+  [; This catch task's ID
+   ^long id
+   ; A friendly name for this catch
+   name
+   ; Arbitrary data
+   data
+   ; Our sole dependency
+   dep-id
+   ; Our handler function
+   f
+   ; Our input promise
+   ^:unsynchronized-mutable input
+   ; Our output
+   ^IDeref output
+   ; The executor we should update when we complete
+   executor]
+  ATask
+
+  ITask
+  (dep-ids [this] [dep-id])
+
+  Runnable
+  (run [this]
+       (try (let [in @input]
+              ; Clear input immediately
+              (set! input nil)
+              (deliver output
+                       (if (instance? Throwable in)
+                         (f in)
+                         in)))
+            (catch Throwable t
+              (deliver output t))
+            (finally
+              (try (when executor
+                     (finish-task! executor this))
+                   (catch Throwable t
+                     (fatal t "Error finishing catch task!" this))))))
+
+  (toString [this]
+            (str "(Catch " id " " (pr-str name)
+                 (when data (str " " (pr-str data)))
+                 "[" dep-id "])")))
 
 (defn pseudotask
   "One of the weird tricks we use (programmers HATE him!) is to abuse the
@@ -254,31 +363,6 @@
 ; Ditto prn
 (defmethod print-method jepsen.history.task.Task [t ^java.io.Writer w]
   (.write w (str t)))
-
-(defn id
-  "Returns the ID of a task."
-  [^Task t]
-  (.id t))
-
-(defn name
-  "Returns the name of a task."
-  [^Task t]
-  (.name t))
-
-(defn data
-  "Returns the custom data associated with a task."
-  [^Task t]
-  (.data t))
-
-(defn dep-ids
-  "Returns a vector of dependency IDs of a task."
-  [^Task t]
-  (vec (.dep-ids t)))
-
-(defn ran?
-  "Returns true iff a task ran already."
-  [^Task t]
-  (realized? (.output t)))
 
 ; An immutable representation of our executor state. By happy circumstance, it
 ; is *also* an immutable representation of a queue, which the executor can pull
@@ -357,9 +441,52 @@
        (= 0 (.size ^ISet (.ready-tasks state)))
        (= 0 (.size ^ISet (.running-tasks state)))))
 
+(defn add-dep-edge
+  "Takes a dependency graph, a dependency task, and a new task. Adds a
+  dependency edge dep -> task iff dep is still pending, returning the new dep
+  graph."
+  [^DirectedGraph dep-graph ^ITask dep ^ITask task]
+  (assert+ (instance? Task dep)
+           IllegalArgumentException
+           (str "Dependencies must be tasks, but got " (pr-str deps)))
+  (if (.contains (.vertices dep-graph) dep)
+    (.link dep-graph dep task)
+    ; Oh hang on, you're trying to add something that we don't
+    ; have. Is it finished?
+    (do (assert+ (ran? dep)
+                 IllegalStateException
+                 (str "Task " (pr-str task) " dependency "
+                      (pr-str dep)
+                      " is unknown and has not finished. This could break liveness!"))
+        dep-graph)))
+
+(defn add-task-helper
+  "Helper for submit* and catch*. Takes a state, a dep graph, and new task,
+  readies the task if possible, increments next-task-id, and creates effects,
+  returning state."
+  [^State state, ^DirectedGraph dep-graph, ^ITask task]
+  ; Is the task ready now?
+  (let [ready? (= 0 (.size ^ISet (.in dep-graph task)))
+        ; If it's ready, we add it to the ready set
+        ready-tasks  ^ISet (.ready-tasks state)
+        ready-tasks' (if ready?
+                       (.add ready-tasks task)
+                       ready-tasks)
+        ; And record effects
+        effects ^IList (.effects state)
+        effects' (.addLast effects [:new-task task])
+        effects' (if ready?
+                   (.addLast effects' [:ready-task task])
+                   effects')]
+    (assoc state
+           :next-task-id  (inc (.next-task-id state))
+           :dep-graph     dep-graph
+           :ready-tasks   ready-tasks'
+           :effects       effects')))
+
 (defn submit*
   "Given a state, constructs a fresh task with the given name, optional data,
-  optional list of Tasks as dependencies, and a function (f dep-results) which
+  optional list of Tasks as dependencies, a function (f dep-results) which
   takes a vector of dependency results. Returns the state with the new task
   integrated, including a [:new-task task], which you can use to read the
   created task.
@@ -381,56 +508,19 @@
          dep-ids    (long-array dep-count)
          inputs     (object-array dep-count)
          _          (loopr [i 0]
-                           [^Task dep deps]
-                           (do (aset dep-ids i (.id dep))
-                               (aset inputs i (.output dep))
+                           [^ITask dep deps]
+                           (do (aset dep-ids i ^long (.id dep))
+                               (aset inputs i (.output ^InternalTask dep))
                                (recur (inc i))))
          task       (Task. id name data dep-ids f inputs (promise)
                            (.executor state))
          ; Update dependency graph
          ^DirectedGraph dep-graph (.dep-graph state)
-         ^DirectedGraph dep-graph'
-         (loopr [^DirectedGraph g (.. dep-graph
-                                      linear
-                                      (add task))]
-                [^Task dep deps]
-                (do (assert+
-                      (instance? Task dep)
-                      IllegalArgumentException
-                      (str "Dependencies must be tasks, but got "
-                           (pr-str deps)))
-                    ; We don't want to add things back to the dep
-                    ; graph if they're already finished
-                    (if (.contains (.vertices g) dep)
-                      (recur (.link g dep task))
-                      ; Oh hang on, you're trying to add something that we don't
-                      ; have. Is it finished?
-                      (do (assert+ (realized? (.output dep))
-                                   IllegalStateException
-                                   (str "Task " (pr-str task) " dependency "
-                                        (pr-str dep)
-                                        " is unknown and has not finished. This could cause deadlock!"))
-                          (recur g))))
-                (.forked g))
-         ; Is the task ready now?
-         ready? (= 0 (.size ^ISet (.in dep-graph' task)))
-         ; If it's ready, we add it to the ready set
-         ready-tasks  ^ISet (.ready-tasks state)
-         ready-tasks' (if ready?
-                        (.add ready-tasks task)
-                        ready-tasks)
-         ; And record effects
-         effects ^IList (.effects state)
-         effects' (.addLast effects [:new-task task])
-         effects' (if ready?
-                    (.addLast effects' [:ready-task task])
-                    effects')]
-     ;(info :new-task task)
-     (assoc state
-            :next-task-id  (inc id)
-            :dep-graph     dep-graph'
-            :ready-tasks   ready-tasks'
-            :effects       effects'))))
+         dep-graph' (loopr [^DirectedGraph g (.. dep-graph linear (add task))]
+                           [dep deps]
+                           (recur (add-dep-edge g dep task))
+                           (.forked g))]
+     (add-task-helper state dep-graph' task))))
 
 (defn submit
   "Like submit*, but also returns the created task: [state new-task]. This form
@@ -452,12 +542,35 @@
    (let [^State state' (submit* state name data deps f)]
      [state' (nth (.last ^IList (.effects state')) 1)])))
 
-(defn order-hint
-  "Ensures that the second task executes only after the first completes, or
-  This is not a logical dependency: the first task's results are not delivered
-  to the second, and the second task's dependencies remain unchanged."
-  [^State state, ^Task task]
-  )
+(defn catch*
+  "Takes a state, a name, optional data, a task to depend on, and a function
+  `f`. If `task` throws, calls `(f exception)`; the result is the output of the
+  catch task. Otherwise passes on input unchanged.
+
+  Returns a new state with this catch task added."
+  ([state name dep f]
+   (catch* state name nil dep f))
+  ([^State state name data ^ITask dep f]
+   (assert+ (not (nil? name)))
+   (assert+ (instance? ITask dep)
+            (str "Dependency must be a task, but got " (pr-str dep)))
+   (let [task  (Catch. (.next-task-id state) name data (.id dep) f
+                       (.output dep) (promise) (.executor state))
+         dep-graph (add-dep-edge (.dep-graph state) dep task)]
+     (add-task-helper state dep-graph task))))
+
+(defn catch
+  "Like catch*, but also returns the created catch task: [state catch-task].
+  This form is more convenient for transactional use.
+
+  Takes a state, a name, optional data, a task to depend on, and a function
+  `f`. If `task` throws, calls `(f exception)`; the result is the output of the
+  catch task. Otherwise passes on input unchanged."
+  ([state name dep f]
+   (catch state name nil dep f))
+  ([state name data dep f]
+   (let [^State state' (catch* state name data dep f)]
+     [state' (nth (.last ^IList (.effects state')) 1)])))
 
 (defn finish
   "Takes a state and a task which has been executed, and marks it as completed.
@@ -738,10 +851,10 @@
   (txn! executor #(finish % task)))
 
 (defn submit!
-  "Submits a new task to an Executor. Takes a task name, an optional collection
-  of Tasks as dependencies, optional data, and a function `(f dep-results)`
-  which receives a map of dependency IDs to their results. Returns a newly
-  created Task object."
+  "Submits a new task to an Executor. Takes a task name, optional data, an
+  optional collection of Tasks as dependencies, and a function `(f
+  dep-results)` which receives a map of dependency IDs to their results.
+  Returns a newly created Task object."
   ([executor name f]
    (submit! executor name nil nil f))
   ([executor name deps f]
@@ -749,6 +862,19 @@
   ([executor name data deps f]
    (let [; Create the task
          ^State state' (txn! executor #(submit* % name data deps f))
+         [_ task] (.last ^IList (.effects state'))]
+     task)))
+
+(defn catch!
+  "Submits a new catch task to an Executor. Takes a name for this task,
+  optional data, a task to depend on, and a function `(f exception)` which will
+  be called if the dependency throws. Returns a newly created Catch task, whose
+  output is either the output of the dependency, or if the dependency throws,
+  whatever `f` returns."
+  ([executor name dep f]
+   (catch! executor name nil dep f))
+  ([executor name data dep f]
+   (let [^State state' (txn! executor #(catch* % name data dep f))
          [_ task] (.last ^IList (.effects state'))]
      task)))
 

@@ -13,7 +13,8 @@
             [dom-top.core :refer [assert+ letr loopr real-pmap]]
             [jepsen.history [core :as hc]
                             [fold :as f]
-                            [task :as t]])
+                            [task :as t]]
+            [tesser.core :as tesser])
   (:import (io.lacuna.bifurcan ISet
                                IList
                                IMap
@@ -26,9 +27,40 @@
   scales up scaling factors to 200. Some of our tests are orders of magnitude
   more expensive than others, so we scale many tests to N x 10 or whatever."
   ;5
-  ;100
-  1000
+  100
+  ;500
   )
+
+;; Simple example-based tests
+
+(deftest ^:focus basic-test
+  (let [dogs [{:legs 6, :name :noodle},
+              {:legs 4, :name :stop-it},
+              {:legs 4, :name :brown-one-by-the-fish-shop}]
+        chunked-dogs (hc/chunked 2 dogs)
+        e (f/executor chunked-dogs)]
+    (testing "reduce"
+      (is (= 6 (reduce (fn reduce-test
+                         ([] 0)
+                         ([max-legs dog]
+                          (max max-legs (:legs dog))))
+                       e))))
+    (testing "reduce init"
+      (is (= 6 (reduce (fn reduce-init-test [max-legs dog]
+                         (max max-legs (:legs dog)))
+                       0
+                       e))))
+
+    (testing "transduce"
+      (let [xf (comp (map :name)
+                     (remove #{:stop-it}))]
+        (is (= [:noodle :brown-one-by-the-fish-shop]
+               (transduce xf conj [] e)))))
+
+    (testing "into"
+      (is (= #{4 6} (into #{} (map :legs) e))))))
+
+;; Generative tests
 
 (defn reporter-fn
   "A reporter that pretty-prints failures, because oh my god these are so hard

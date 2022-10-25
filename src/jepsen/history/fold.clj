@@ -1,5 +1,57 @@
 (ns jepsen.history.fold
-  "Represents and executes graphs of folds over histories.
+  "Provides a stateful executor for running folds (reduces) over chunked,
+  immutable collections in linear and concurrent passes. Intended for systems
+  where the reduction over a chunk may involve expensive work, and not fit in
+  memory--for instance, deserializing values from disk. Provides sophisticated
+  optimizations for running folds in parallel, and automatically fusing
+  together multiple folds.
+
+  To build an executor, you need a chunkable collection: see
+  jepsen.history.core. Jepsen.history chunks vectors by default at 16384
+  elements per chunk, which is a bit big for a demonstration, so let's chunk
+  explicitly:
+
+    (require '[tesser.core :as t] '[jepsen.history [core :as hc] [fold :as f]])
+    (def dogs [{:legs 6, :name :noodle},
+               {:legs 4, :name :stop-it},
+               {:legs 4, :name :brown-one-by-the-fish-shop}])
+    (def chunked-dogs (hc/chunked 2 dogs))
+    (pprint (hc/chunks chunked-dogs))
+    ; ([{:legs 6, :name :noodle} {:legs 4, :name :stop-it}]
+    ;  [{:legs 4, :name :brown-one-by-the-fish-shop}])
+
+  In real use, chunks should be big enough to take a bit (a second or so?) to
+  reduce. We keep track of some state for each chunk, so millions is probably
+  too many. If you have fewer chunks than processors, we won't be able to
+  optimize as efficiently.
+
+  A fold executor wraps a chunked collection, like so:
+
+    (def e (f/executor chunked-dogs))
+
+  Now we can perform a reduction on the executor. This works just like Clojure
+  reduce:
+
+    (reduce (fn [max-legs dog]
+              (max max-legs (:legs dog)))
+            0
+            e)
+    ; => 6
+
+  Which means transducers and into work like you'd expect:
+
+    (into #{} (map :legs) e)
+    ; => #{4 6}
+
+
+
+
+
+  Now we can perform folds. Our executor uses
+  [Tesser](https://github.com/aphyr/tesser)'s fold representation, so we can
+  run any Tesser fold here:
+
+
 
   A fold represents a reduction over a history, which can optionally be
   executed over chunks concurrently. It's a map with the following fields:
@@ -136,12 +188,18 @@
   a fold to the executor returns a Handle. Handles support the usual IDeref to
   block on results and receive exceptions. They also support additional
   control-flow functions for launching and cancelling folds."
-  (:require [clojure [pprint :as pprint :refer [pprint]]]
+  (:refer-clojure :exclude [reduce])
+  (:require [clojure [core :as c]
+                     [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ loopr]]
             [jepsen.history [core :as hc]
-                            [task :as task]])
-  (:import (io.lacuna.bifurcan DirectedGraph
+                            [task :as task]]
+            [slingshot.slingshot :refer [try+ throw+]]
+            [tesser.core :as tesser])
+  (:import (clojure.lang IReduce
+                         IReduceInit)
+           (io.lacuna.bifurcan DirectedGraph
                                IEdge
                                IGraph
                                Graph)))
@@ -172,6 +230,26 @@
         Integer/MIN_VALUE
         (recur (dec i))))))
 
+; Support functions for working with folds
+(defn reduce->fold
+  "Takes a reduce function, or a reduce fn and an init value, and yields a fold
+  from it."
+  ([f init]
+   {:name                 :reduce
+    :reducer-identity     (constantly init)
+    :reducer              f
+    :post-reducer         identity
+    :combiner-identity    (constantly nil)
+    :combiner             (fn trivial [a b] b)
+    :post-combiner        identity})
+  ([f]
+   {:name                 :reduce
+    :reducer-identity     f
+    :reducer              f
+    :post-reducer         identity
+    :combiner-identity    (constantly nil)
+    :combiner             (fn trivial [a b] b)
+    :post-combiner        identity}))
 
 ; We want to run multiple folds concurrently. This FusedFold datatype allows
 ; that, and can be extended with new folds later. It returns a vector of
@@ -372,11 +450,11 @@
                 [:reduce i]
                 (if (= i 0) [] [prev-reduce])
                 (fn task [in]
-                  ; (info "Linear reduce" i in)
+                  ; (info "Linear reduce" i (first in))
                   (let [acc (if (= i 0)
                               (reducer-identity)
                               (first in))]
-                    (reduce reducer acc (nth chunks i)))))))
+                    (c/reduce reducer acc (nth chunks i)))))))
 
 (defn make-linear-combine-task
   "Takes a task executor state, a fold, chunks, and the final reduce task.
@@ -426,9 +504,9 @@
                  (fn task [_]
                    ; (info :reduce i)
                    (post-reducer
-                     (reduce reducer
-                             (reducer-identity)
-                             (nth chunks i)))))))
+                     (c/reduce reducer
+                               (reducer-identity)
+                               (nth chunks i)))))))
 
 (defn make-concurrent-combine-task
   "Takes a task executor state, a fold, chunks, a chunk index, and either:
@@ -472,32 +550,39 @@
   ([state fold task deliver-fn]
    (make-deliver-task state fold task deliver-fn nil))
   ([state {:keys [post-combiner]} task deliver-fn executor]
-   (task/submit state
-                [:deliver]
-                [task]
-                (fn deliver [[combined]]
-                  (try
-                    ; (info :deliver combined)
-                    (deliver-fn (post-combiner combined))
-                    (try (when executor (clear-old-passes! executor))
-                         (catch RuntimeException t
-                           (warn t "Couldn't clear old passes!")))
-                    (catch Throwable t
-                      (deliver-fn t)))))))
+   (let [[state deliver-task]
+         (task/submit state
+                      [:deliver]
+                      [task]
+                      (fn deliver [[combined]]
+                        ; (info :deliver combined)
+                        (deliver-fn (post-combiner combined))
+                        (when executor (clear-old-passes! executor))))
+         ; If something goes wrong in our pipeline, we deliver a CapturedThrow
+         ; instead.
+         [state catch-task]
+         (task/catch state :deliver-catch deliver-task
+                     (fn catch [err] (deliver-fn (task/->CapturedThrow err))))]
+     [state deliver-task])))
 
 (defn split-deliver-fn
   "Takes an old and new pass. Constructs a function which takes an [old-res
-  new-res] pair and delivers them to the old and new folds' deliver fns,
-  respectively."
+  new-res] pair, or a CapturedThrowable, and delivers them to the old and new
+  folds' deliver fns, respectively."
   [old-pass new-pass]
   (let [old-deliver (:deliver old-pass)
         new-deliver (:deliver new-pass)]
-    (fn deliver [[old-res new-res]]
+    (fn deliver [input]
       (try
-        (old-deliver old-res)
-        (new-deliver new-res)
+        (if (task/captured-throw? input)
+          (do (old-deliver input)
+              (new-deliver input))
+          (let [[old-res new-res] input]
+            (old-deliver old-res)
+            (new-deliver new-res)))
         (catch Throwable t
-          (warn t "Split deliver failed! Some folds may never complete."))))))
+          (warn t "Split deliver of"
+                (pr-str input) "failed! Some folds may never complete."))))))
 
 (defn make-split-task
   "Takes a task executor state, a name, a function that splits an accumulator,
@@ -552,7 +637,7 @@
     ; Unknown, definitely not cancellable!
     nil (throw (ex-info {:type :impossible-cancellation
                          :task task}))
-    (reduce task/cancel state (task-workers task))))
+    (c/reduce task/cancel state (task-workers task))))
 
 ; Pass construction
 
@@ -623,7 +708,7 @@
       (pass-str state tasks))
     ; [name task] pairs
     (let [sb (StringBuilder.)
-          name-len (reduce max 0 (map (comp count name first) pass-or-tasks))
+          name-len (c/reduce max 0 (map (comp count name first) pass-or-tasks))
           format-str (str "%1$" name-len "s")]
       (loopr [i 0]
              [[task-name tasks] pass-or-tasks]
@@ -1198,13 +1283,20 @@
     :linear     (join-linear-pass state old-pass new-pass)
     :concurrent (join-concurrent-pass state old-pass new-pass)))
 
-(deftype Executor
-  [task-executor
-   history
-   passes])
+(declare fold)
+(deftype Executor [^jepsen.history.task.Executor task-executor
+                   history
+                   passes]
+  IReduce
+  (reduce [this f]
+    (fold this (reduce->fold f)))
+
+  IReduceInit
+  (reduce [this f init]
+    (fold this (reduce->fold f init))))
 
 (defn executor
-  "Starts a new executor for folds over the given chunkable history"
+  "Starts a new executor for folds over the given chunkable history."
   [history]
   (Executor. (task/executor)
              history
@@ -1296,10 +1388,30 @@
   [{:keys [combiner-identity post-combiner]}]
   (post-combiner (combiner-identity)))
 
+(defn validate-fold
+  "Throws if fold is malformed. Returns fold otherwise."
+  [fold]
+  (when-not (:name fold)
+    (throw+ {:type ::no-name, :fold fold}))
+  (when-not (fn? (:reducer-identity fold))
+    (throw+ {:type :no-reducer-identity, :fold fold}))
+  (when-not (fn? (:reducer fold))
+    (throw+ {:type :no-reducer, :fold fold}))
+  (when-not (fn? (:post-reducer fold))
+    (throw+ {:type :no-post-reducer, :fold fold}))
+  (when-not (fn? (:combiner-identity fold))
+    (throw+ {:type :no-combiner-identity, :fold fold}))
+  (when-not (fn? (:combiner fold))
+    (throw+ {:type :no-combiner, :fold fold}))
+  (when-not (fn? (:post-combiner fold))
+    (throw+ {:type :no-post-combiner, :fold fold}))
+  fold)
+
 (defn pfold
   "Executes a fold on the given executor asynchronously. Returns a
   deref-able result."
   [^Executor executor fold]
+  (validate-fold fold)
   (let [chunks      (hc/chunks (.history executor))
         chunk-count (count chunks)]
     (condp = chunk-count
@@ -1316,5 +1428,8 @@
   "Executes a fold on the given executor synchronously. Returns result of the
   fold."
   [executor fold]
-  @(pfold executor fold))
-  ;(deref (pfold executor fold) 1000 :timeout))
+  (task/throw-captured
+    (let [result (pfold executor fold)]
+      ; (info :fold :result result)
+      ;(pfold executor fold))
+      (deref (pfold executor fold) 1000 :timeout))))

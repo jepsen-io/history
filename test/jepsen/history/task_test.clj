@@ -37,6 +37,7 @@
         (is (= 1 (t/id a)))
         (is (= :a-name (t/name a)))
         (is (= :custom-data (t/data a)))
+        @a
         (is (= [[:a []]] @log))))
 
     (testing "dependent ops"
@@ -68,10 +69,18 @@
 
 (deftest exception-test
   (let [e (t/executor)]
-    (let [a (t/submit! e :a     (fn [_] (assert false)))
-          _ (is (thrown? AssertionError @a))
-          b (t/submit! e :b [a] (fn [a-in] :b))]
-      _ (is (thrown? AssertionError @b)))))
+    (testing "Deref propagation"
+      (let [a (t/submit! e :a     (fn [_] (assert false)))
+            _ (is (thrown? AssertionError @a))
+            b (t/submit! e :b [a] (fn [a-in] :b))]
+        _ (is (thrown? AssertionError @b))))
+
+    (testing "Catch"
+      (let [p (promise)
+            a (t/submit! e :a (fn [_] @p (/ 1 0)))
+            b (t/catch!  e :b a (fn [err] [:caught (.getMessage err)]))]
+        (deliver p nil)
+        (is (= [:caught "Divide by zero"] @b))))))
 
 (deftest cancel-test
   (let [e    (t/executor)
