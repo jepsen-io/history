@@ -270,13 +270,10 @@
                       ((:reducer fold) acc x)))))
 
 (defn concurrent-pass
-  "Constructs a fresh concurrent pass over chunks. Always does a type pass."
+  "Constructs a fresh concurrent pass over chunks. Always does a type pass; we
+  don't actually run these, and it makes debugging easier."
   [chunks]
-  (let [result (promise)]
-    (assoc (f/concurrent-pass chunks (fold-type (rand-nth [:a :b :c :d]))
-                              (fn [x] ;(info :concurrent-pass-deliver x)
-                                (deliver result x)))
-           :result result)))
+  (f/pass (fold-type (rand-nth [:a :b :c :d])) chunks))
 
 (defn concurrent-pass-gen
   "Generates a fresh concurrent pass over chunks."
@@ -598,11 +595,7 @@
                ; The folds are huge and not important
                :old-pass (dissoc old-pass :fold :deliver)
                :new-pass (dissoc new-pass :fold :deliver)
-               :pass     (dissoc pass :fold :deliver)
-               :print    (fn []
-                           (println
-                             (f/print-join-plan
-                               state' old-pass new-pass pass))))))))
+               :pass     (dissoc pass :fold :deliver))))))
 
 (defn join-concurrent-passes-result
   "Takes inputs for join-concurrent-passes and returns a test.check result.
@@ -715,12 +708,8 @@
                                          (inc (/ size 10)))
                                          small-pos-int)
                  fold       fold-gen]
-                (let [stdout     (StringWriter.)]
-                  (binding [;*out* stdout
-                            ;*err* stdout
-                            ]
-                    (let [executor   (f/executor (hc/chunked chunk-size dogs))]
-                      (test-fold executor chunk-size dogs fold))))))
+                (let [executor   (f/executor (hc/chunked chunk-size dogs))]
+                  (test-fold executor chunk-size dogs fold))))
 
 ; Submits a bunch of folds at the same time to a single executor. Stress-tests
 ; all the concurrency safety!
@@ -730,15 +719,11 @@
                                          (inc (/ size 10)))
                                          small-pos-int)
                  folds      (gen/vector basic-fold-gen)]
-                ; Just for now, cuz all I implemented was concurrent folds
-                (let [folds (mapv #(assoc % :associative? true) folds)]
-                  ;(info "parallel dogs" (count dogs) "chunk-size" chunk-size
-                  ;      "folds" (mapv :name folds))
-                  (let [executor (f/executor (hc/chunked chunk-size dogs))
-                        results  (real-pmap
-                                   (partial test-fold executor chunk-size dogs)
-                                   folds)]
-                    (all-results results)))))
+                (let [executor (f/executor (hc/chunked chunk-size dogs))
+                      results  (real-pmap
+                                 (partial test-fold executor chunk-size dogs)
+                                 folds)]
+                  (all-results results))))
 
 ; LORGE DATA. This one still tests safety and compares results to the models.
 (defspec ^:slow fold-equiv-parallel-lorge n
