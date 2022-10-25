@@ -232,7 +232,8 @@
   (toString [this]
     (str "(Task " id " " (pr-str name)
          (when data (str " " (pr-str data)))
-         (when (< 0 (alength dep-ids)) (str " " (pr-str (vec dep-ids))))
+         (when (< 0 (alength ^objects dep-ids))
+           (str " " (pr-str (vec dep-ids))))
          ")")))
 
 (defn pseudotask
@@ -380,7 +381,7 @@
          dep-ids    (long-array dep-count)
          inputs     (object-array dep-count)
          _          (loopr [i 0]
-                           [dep deps]
+                           [^Task dep deps]
                            (do (aset dep-ids i (.id dep))
                                (aset inputs i (.output dep))
                                (recur (inc i))))
