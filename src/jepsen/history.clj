@@ -7,7 +7,90 @@
   We also provide a special History datatype. This type wraps an ordered
   collection, and acts like a vector. However, it also provides
   automatically-computed, memoized auxiliary structures, like a pair index
-  which allows callers to quickly map between invocations and completions."
+  which allows callers to quickly map between invocations and completions.
+
+  ## Scheduling
+
+  There are several challenges for Jepsen checkers.
+
+  1. We have no idea how many other checkers are executing, or what kind of
+     data they intend to compute. This causes duplicated work and many passes
+     over the underlying history.
+
+  2. We're running on fixed hardware with a finite pool of CPUs, and want to
+     spawn a reasonable number of tasks, take advantage of at least *some*
+     memory and cache locality, etc.
+
+  3. Checkers want to be able to ask for the results of a fold at any time, and
+     block until it's ready.
+
+  4. But a regular function call like `reduce` won't work: a caller might do
+     (reduce a history) (reduce b history) and we wouldn't know that a and b
+     could have been executed in one pass.
+
+  5. Sometimes we want delay-like behavior. Histories can declare, for
+     instance, that they have a pair index or a count available, but those
+     computations shouldn't be performed until someone asks for them.
+
+  6. Sometimes we want future-like behavior: we know we'll use the results of a
+     computation, and starting it now is more efficient than waiting for
+     someone to ask for it.
+
+  All of this suggests to me that the normal approaches to concurrent execution
+  (e.g. just spawning a bunch of futures or delays) are not going to work: we
+  need a new, richer kind of control flow here. The need to coordinate between
+  callers who are not aware of each other also tells us that whatever executes
+  folds should be a shared, mutable thing rather than a pure, immutable
+  structure. For example, we might want:
+
+                  +-------------------------+   +-----------------------+
+                  |    Original History     |---|   Dataflow Executor   |
+                  +-------------------------+   +-----------------------+
+                            ^     ^
+                  +---------|     |---------+
+                  |                         |
+    +-------------------------+    +--------------------------+
+    | History w/just clients  |    |  History w/just writes   |
+    +-------------------------+    +--------------------------+
+        ^                               ^
+        +--Build a pair index           +--Build a pair index
+        |                               |
+        +--With that, find G1a          +--With that, compute latencies
+        |
+        +--Count ok ops
+
+  Two different checkers construct different histories derived from the main
+  history--the left checker makes a view just with client ops, and the right
+  checker makes a view with just writes. Both are implemented as lazy views
+  over the original history.
+
+  Then the clients start performing queries. They submit these queries to their
+  individual histories, which in turn pass them up (with some translation) to
+  the original history, which hands them to the dataflow executor. Let's say:
+
+  1. The left checker asks for G1a first. The dataflow executor realizes it
+     needs to compute a pair index first, so it begins that pass over the raw
+     history.
+
+  2. The left checker asks for a count of OK ops. The executor completes its
+     pair-index pass of the first chunk, checks its state, and realizes that
+     since neither has a dependency on the other, these operations can be
+     unified into a single pass. It counts the first chunk, then merges the
+     pair-index and count folds into a single fold and begins the remaining
+     chunks.
+
+  3. The right checker asks for latencies. Since this depends on the pair
+     index, which is currently under computation, the executor defers the fold
+     for later.
+
+  4. The executor completes its first pass and delivers the results of the pair
+     index and count. It discovers that the G1a and latencies can also be
+     computed in a single pass, constructs a merged fold, and begins executing
+     them. Once they complete, their results are delivered to the two checkers.
+
+  This pre-emption and merging of fold passes is important: without it, we
+  would need callers to block and coordinate when they actually asked for
+  results."
   (:require [clojure.core.reducers :as r]
             [dom-top.core :refer [assert+ loopr]]
             [jepsen.history.core :refer [AbstractVector]]

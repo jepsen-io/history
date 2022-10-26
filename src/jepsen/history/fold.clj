@@ -1,12 +1,12 @@
 (ns jepsen.history.fold
-  "Provides a stateful executor for running folds (reduces) over chunked,
+  "Provides a stateful folder for running folds (like `reduce`) over chunked,
   immutable collections in linear and concurrent passes. Intended for systems
   where the reduction over a chunk may involve expensive work, and not fit in
   memory--for instance, deserializing values from disk. Provides sophisticated
   optimizations for running folds in parallel, and automatically fusing
   together multiple folds.
 
-  To build an executor, you need a chunkable collection: see
+  To build a folder, you need a chunkable collection: see
   jepsen.history.core. Jepsen.history chunks vectors by default at 16384
   elements per chunk, which is a bit big for a demonstration, so let's chunk
   explicitly:
@@ -25,11 +25,11 @@
   too many. If you have fewer chunks than processors, we won't be able to
   optimize as efficiently.
 
-  A fold executor wraps a chunked collection, like so:
+  A folder wraps a chunked collection, like so:
 
-    (def e (f/executor chunked-dogs))
+    (def f (f/folder chunked-dogs))
 
-  Now we can perform a reduction on the executor. This works just like Clojure
+  Now we can perform a reduction on the folder. This works just like Clojure
   reduce:
 
     (reduce (fn [max-legs dog]
@@ -40,63 +40,116 @@
 
   Which means transducers and into work like you'd expect:
 
-    (into #{} (map :legs) e)
+    (into #{} (map :legs) f)
     ; => #{4 6}
 
+  OK, great. What's the point? Imagine we had a collection where getting
+  elements was expensive--for instance, if they required IO or expensive
+  processing. Let's put ten million dogs on disk as JSON.
 
+    (require '[jepsen.history.fold-test :as ft])
+    (def dogs (ft/gen-dogs-file! 1e7))
+    (def f (f/folder dogs))
 
+  Reducing over ten million dogs as JSON takes about 8.67 seconds on my
+  machine.
 
+    (time (into #{} (map :legs) dogs))
+    ; 8678 msecs
 
-  Now we can perform folds. Our executor uses
-  [Tesser](https://github.com/aphyr/tesser)'s fold representation, so we can
-  run any Tesser fold here:
+  But with a folder, we can do something *neat*:
 
+    (def leg-set {:reducer-identity   (constantly #{})
+                  :reducer            (fn [legs dog] (conj legs (:legs dog)))
+                  :combiner           clojure.set/union})
+    (time (f/fold f leg-set))
+    ; 1534 msecs
 
+  This went roughly six times faster because the folder reduced each chunk in
+  parallel. Now let's run, say, ten reductions in parallel.
+
+    (time (doall (pmap (fn [_] (into #{} (map :legs) dogs)) (range 10))))
+    ; 28477 msecs
+
+  This 28 seconds is faster than running ten folds sequentially (which would
+  have been roughly 87 seconds), because we've got multiple cores to do the
+  reduction. But we're still paying a significant cost because each of those
+  reductions has to re-parse the file as it goes.
+
+    (time (doall (pmap (fn [_] (f/fold f leg-set)) (range 10))))
+    ; 3628 msecs
+
+  Eight times faster than the parallel version!
 
   A fold represents a reduction over a history, which can optionally be
   executed over chunks concurrently. It's a map with the following fields:
 
-    {; Metadata
+    ; Metadata
 
-     :name              The unique name of this fold. May be any object, but
-                        probably a keyword.
-     :dependencies      A set of names which this fold needs to have execute
-                        first.
+    :name              The unique name of this fold. May be any object, but
+                       probably a keyword.
 
-     ; How to reduce a chunk
+    ; How to reduce a chunk
 
-     :reducer-identity  A function (f history) which generates an identity
-                        object for a reduction over a chunk.
+    :reducer-identity  A function (f history) which generates an identity
+                       object for a reduction over a chunk.
 
-     :reducer           A function (f history acc op) which takes a history, a
-                        chunk accumulator, and an operation from the history,
-                        and returns a new accumulator.
+    :reducer           A function (f history acc op) which takes a history, a
+                       chunk accumulator, and an operation from the history,
+                       and returns a new accumulator.
 
-     :post-reducer      A function (f history acc) which takes the final
-                        accumulator from a chunk and transforms it before being
-                        passed to the combiner
+    :post-reducer      A function (f history acc) which takes the final
+                       accumulator from a chunk and transforms it before being
+                       passed to the combiner
 
-     ; How to combine chunks together
+    ; How to combine chunks together
 
-     :combiner-identity A function (f history) which generates an identity
-                        object for combining chunk results together.
+    :combiner-identity A function (f history) which generates an identity
+                       object for combining chunk results together.
 
-     :combiner          A function (f history acc chunk-result) which folds
-                        the result of a chunk into the combiner's accumulator.
+    :combiner          A function (f history acc chunk-result) which folds
+                       the result of a chunk into the combiner's accumulator.
+                       If nil, performs a left fold linearly, and does not
+                       combine at all.
 
-     :post-combiner     A function (f history acc) which takes the final acc
-                        from merging all chunks and produces the fold's return
-                        value.
+    :post-combiner     A function (f history acc) which takes the final acc
+                       from merging all chunks and produces the fold's return
+                       value.
 
-     ; Execution hints
+    ; Execution hints
 
-     :associative?      If true, we can start reducing chunks concurrently. If
-                        false, we must reduce chunk 0, then 1, etc.}
+    :associative?      If true, the combine function is associative, and can
+                       be applied in any order. If false, we must combine
+                       left-to-right. Right now this does nothing; we haven't
+                       implemented associative combine.
+
+    :asap?             If true, prioritizes execution of this fold as quickly
+                       as possible. This makes other folds less efficient to
+                       join, and can slow down the system overall when you do
+                       multiple folds in parallel.
 
   Folds should be pure functions of their histories, though reducers and
   combiners are allowed to use in-memory mutability; each is guaranteed to be
-  single-threaded. The final return value from a fold should be immutable so
-  that other readers or folds can use it safely in a concurrent context.
+  single-threaded. We guarantee that reducers execute at most once per element,
+  and at most once per chunk. When not using `reduced`, they are exactly-once.
+  The final return value from a fold should be immutable so that other readers
+  or folds can use it safely in a concurrent context.
+
+  ## Early Termination
+
+  For linear folds (e.g. those with no combiner), we support the usual
+  `(reduced x)` early-return mechanism. This means reduce and transduce work as
+  you'd expect. Reduced values still go through the post-reducer function.
+
+  For concurrent folds, `(reduced x)` in a reducer terminates reduction of that
+  particular chunk. Other chunks are still reduced. Reduced values
+  go through post-reduce and are passed to the combiner unwrapped.
+  If the combiner returns a reduced value, that value passes immediately to the
+  post-combiner, without considering any other chunks.
+
+  Like transducers, post-reducers and post-combiners act on the values inside
+  Reduced wrappers; they cannot distinguish between reduced and non-reduced
+  values.
 
   ## Scheduling
 
@@ -196,7 +249,8 @@
             [jepsen.history [core :as hc]
                             [task :as task]]
             [slingshot.slingshot :refer [try+ throw+]]
-            [tesser.core :as tesser])
+            [tesser [core :as tesser]
+                    [utils :refer [maybe-unary]]])
   (:import (clojure.lang IReduce
                          IReduceInit)
            (io.lacuna.bifurcan DirectedGraph
@@ -230,26 +284,97 @@
         Integer/MIN_VALUE
         (recur (dec i))))))
 
-; Support functions for working with folds
-(defn reduce->fold
-  "Takes a reduce function, or a reduce fn and an init value, and yields a fold
-  from it."
-  ([f init]
-   {:name                 :reduce
-    :reducer-identity     (constantly init)
-    :reducer              f
-    :post-reducer         identity
-    :combiner-identity    (constantly nil)
-    :combiner             (fn trivial [a b] b)
-    :post-combiner        identity})
-  ([f]
-   {:name                 :reduce
-    :reducer-identity     f
-    :reducer              f
-    :post-reducer         identity
-    :combiner-identity    (constantly nil)
-    :combiner             (fn trivial [a b] b)
-    :post-combiner        identity}))
+(defn reduced-wrapper
+  "Wraps a reducing function to wrap reduced results in another reduced
+  wrapper, so that we can detect it and terminate early."
+  [reducer]
+  (fn wrapper [acc x]
+    (let [acc' (reducer acc x)]
+      (if (reduced? acc')
+        (reduced acc')
+        acc'))))
+
+; Support functions for constructing folds
+(defn validate-fold
+  "Throws if fold is malformed. Returns fold otherwise."
+  [fold]
+  (when-not (:name fold)
+    (throw+ {:type ::no-name, :fold fold}))
+  (when-not (fn? (:reducer-identity fold))
+    (throw+ {:type :no-reducer-identity, :fold fold}))
+  (when-not (fn? (:reducer fold))
+    (throw+ {:type :no-reducer, :fold fold}))
+  (when-not (fn? (:post-reducer fold))
+    (throw+ {:type :no-post-reducer, :fold fold}))
+  ; Combiners are optional, but if you give one, you need all three fns
+  (when (:combiner fold)
+    (when-not (fn? (:combiner fold))
+      (throw+ {:type :no-combiner, :fold fold}))
+    (when-not (fn? (:combiner-identity fold))
+      (throw+ {:type :no-combiner-identity, :fold fold}))
+    (when-not (fn? (:post-combiner fold))
+      (throw+ {:type :no-post-combiner, :fold fold})))
+  fold)
+
+
+(defn make-fold
+  "Takes a fold map, or a function, or two functions, and expands them into a
+  full fold map. Generally follows the same rules as transducers:
+  https://clojure.org/reference/transducers#_creating_transducers. With a map:
+
+    - `:name`: default :fold
+    - `:associative?`: default false
+    - `:reducer-identity`: defaults to `:reducer`
+    - `:reducer`: must be provided
+    - `:post-reducer`: defaults to `:reducer`, or `identity` if `:reducer` has
+      no unary arity.
+    - `:combiner-identity`: defaults to `:combiner`
+    - `:combiner`: defaults to nil
+    - `:post-combiner` defaults to `:combiner`, or `identity` if `:combiner` has
+      no unary arity.
+
+  With a single function, works exactly like transducers. Constructs a
+  non-associative fold named `:fold` with no combiner, and using f for all
+  three reducer functions.
+
+  With two functions, uses the first for all three reducers, and the second for
+  all three combiners. This is the *opposite* arity from
+  `clojure.core.reducers/fold`, but I really do think it makes more sense,
+  since reduce happens first."
+  ([fn-or-map]
+   (if (map? fn-or-map)
+     (let [reducer  (if (map? fn-or-map)
+                      (assert+ (:reducer fn-or-map)
+                               (str "No :reducer provided! "
+                                    (pr-str fn-or-map)))
+                      fn-or-map)
+           combiner (:combiner fn-or-map)]
+       (assoc fn-or-map
+              :name              (or (:name fn-or-map) :fold)
+              :reducer-identity  (or (:reducer-identity fn-or-map) reducer)
+              :post-reducer      (or (:post-reducer fn-or-map)
+                                     (maybe-unary reducer))
+              :combiner-identity (or (:combiner-identity fn-or-map)
+                                     combiner)
+              :post-combiner     (or (:post-combiner fn-or-map)
+                                     (when combiner
+                                       (maybe-unary combiner)))
+              :associative?      (:associative? fn-or-map false)))
+     ; Single reducer fn
+     {:name              :fold
+      :reducer-identity  fn-or-map
+      :reducer           fn-or-map
+      :post-reducer      (maybe-unary fn-or-map)
+      :associative?      false}))
+  ([reducer combiner]
+   {:name               :fold
+    :associative?       false
+    :reducer-identity   reducer
+    :reducer            reducer
+    :post-reducer       (maybe-unary reducer)
+    :combiner-identity  combiner
+    :combiner           combiner
+    :post-combiner      (maybe-unary combiner)}))
 
 ; We want to run multiple folds concurrently. This FusedFold datatype allows
 ; that, and can be extended with new folds later. It returns a vector of
@@ -304,71 +429,28 @@
                         original and new fold. Works on both reduce and combine
                         accumulators. Returns an accumulator for the new fold.
 
+  Works with both folds that have combiners and those that don't.
+
   If this isn't fast enough, we might try doing some insane reflection and
   dynamically compiling a new class to hold reducer state with primitive
   fields."
   [old-fold new-fold]
-  (let [; If we're fusing into a fused fold, we slot in our fold at the end of
+  (let [_ (when (:combiner old-fold)
+            (assert+ (:combiner new-fold)
+                     {:type ::mismatched-folds
+                      :old old-fold
+                      :new new-fold}))
+        ; If we're fusing into a fused fold, we slot in our fold at the end of
         ; its existing folds.
-        folds' (if (fused? old-fold)
-                 (conj (:folds old-fold) new-fold)
-                 ; We have no insight here; just make a pair.
-                 [old-fold new-fold])
-        ; The reducer identity constructs an array of reducer identities
-        reducer-identity
-        (fn reducer-identity []
-          (->> folds'
-               (map (fn [fold]
-                      ((:reducer-identity fold))))
-               object-array))
-        ; Reducers update each field in the array. This is a *very* hot path.
-        ; We pre-materialize an array of reducer functions to speed up
-        ; traversal. We clobber reducer array state in-place. This SHOULD, I
-        ; think, be OK because of the memory happens-before effects of the task
-        ; executor's queue.
-        reducers (object-array (map :reducer folds'))
-        n        (alength reducers)
-        reducer (fn reducer [^objects accs x]
-                  (loop [i 0]
-                    (if (< i n)
-                      (let [reducer (aget reducers i)
-                            acc     (aget accs i)
-                            acc'    (reducer acc x)]
-                        (aset accs i acc')
-                        (recur (unchecked-inc-int i)))
-                      ; Done
-                      accs)))
-        ; Post-reducers again update each field in the array. We can clobber it
-        ; in-place.
-        post-reducers (object-array (map :post-reducer folds'))
-        post-reducer  (fn post-reducer [^objects accs]
-                        (loop [i 0]
-                          (if (< i n)
-                            (let [post-reducer (aget post-reducers i)
-                                  acc          (aget accs i)
-                                  acc'         (post-reducer acc)]
-                              (aset accs i acc')
-                              (recur (unchecked-inc-int i)))
-                            ; Done
-                            accs)))
-        ; Combiners: same deal
-        combiner-identity (fn combiner-identity []
-                            (->> folds'
-                                 (map (fn [fold]
-                                        ((:combiner-identity fold))))
-                                 object-array))
-        combiners (object-array (map :combiner folds'))
-        combiner (fn combiner [^objects accs ^objects xs]
-                   (loop [i 0]
-                     (if (< i n)
-                       (let [combiner (aget combiners i)
-                             acc (aget accs i)
-                             x   (aget xs i)
-                             acc' (combiner acc x)]
-                         (aset accs i acc')
-                         (recur (unchecked-inc-int i)))
-                       accs)))
-        ; Now we need functions to join together reducer and combiner state.
+        folds'    (if (fused? old-fold)
+                    (conj (:folds old-fold) new-fold)
+                    ; We have no insight here; just make a pair.
+                    [old-fold new-fold])
+        n         (count folds')
+        _         (assert (< 1 n))
+        combiner? (boolean (:combiner old-fold))
+
+        ; We need functions to join together reducer and combiner state.
         ; The shape here is going to depend on whether the original fold was a
         ; FusedFold (in which case it has an array of accs) or a normal fold
         ; (in which case it has a single acc).
@@ -393,14 +475,80 @@
                      ; Both simple folds
                      (fn split-unfused [^objects accs]
                        [(aget accs 0) (aget accs 1)]))
+
+        ; The reducer identity constructs an array of reducer identities
+        reducer-identity
+        (fn reducer-identity []
+          (->> folds'
+               (map (fn [fold]
+                      ((:reducer-identity fold))))
+               object-array))
+        ; Reducers update each field in the array. This is a *very* hot path.
+        ; We pre-materialize an array of reducer functions to speed up
+        ; traversal. We clobber reducer array state in-place. This SHOULD, I
+        ; think, be OK because of the memory happens-before effects of the task
+        ; executor's queue.
+        reducers (object-array (map :reducer folds'))
+        reducer (fn reducer [^objects accs x]
+                  (loop [i 0]
+                    (if (< i n)
+                      (let [reducer (aget reducers i)
+                            acc     (aget accs i)
+                            acc'    (reducer acc x)]
+                        (aset accs i acc')
+                        (recur (unchecked-inc-int i)))
+                      ; Done
+                      accs)))
+        post-reducer  (if combiner?
+                        ; Post-reducers just update each field in the array.
+                        ; We can clobber it in-place.
+                        (let [post-reducers (object-array
+                                              (map :post-reducer folds'))]
+                          (fn post-reducer [^objects accs]
+                            (loop [i 0]
+                              (if (< i n)
+                                (let [post-reducer (aget post-reducers i)
+                                      acc          (aget accs i)
+                                      acc'         (post-reducer acc)]
+                                  (aset accs i acc')
+                                  (recur (unchecked-inc-int i)))
+                                ; Done
+                                accs))))
+                        ; Unlift results back to [old-res new-res]
+                        (let [old-post-reducer (:post-reducer old-fold)
+                              new-post-reducer (:post-reducer new-fold)]
+                          (fn post-reducer-unlift [accs]
+                            (let [[old-acc new-acc] (split-accs accs)]
+                              [(old-post-reducer old-acc)
+                               (new-post-reducer new-acc)]))))
+        ; Combiners: same deal
+        combiner-identity (when combiner?
+                            (fn combiner-identity []
+                              (->> folds'
+                                   (map (fn [fold]
+                                          ((:combiner-identity fold))))
+                                   object-array)))
+        combiners (object-array (map :combiner folds'))
+        combiner (when combiner?
+                   (fn combiner [^objects accs ^objects xs]
+                     (loop [i 0]
+                       (if (< i n)
+                         (let [combiner (aget combiners i)
+                               acc (aget accs i)
+                               x   (aget xs i)
+                               acc' (combiner acc x)]
+                           (aset accs i acc')
+                           (recur (unchecked-inc-int i)))
+                         accs))))
         ; Turn things back into a pair of [old-res new-res] on the way
         ; out.
         old-post-combiner (:post-combiner old-fold)
         new-post-combiner (:post-combiner new-fold)
-        post-combiner (fn post-combiner [^objects accs]
-                        (let [[old-acc new-acc] (split-accs accs)]
-                          [(old-post-combiner old-acc)
-                           (new-post-combiner new-acc)]))
+        post-combiner (when combiner?
+                        (fn post-combiner [accs]
+                          (let [[old-acc new-acc] (split-accs accs)]
+                            [(old-post-combiner old-acc)
+                             (new-post-combiner new-acc)])))
         fused (map->FusedFold
                 {:name              [(:name old-fold) (:name new-fold)]
                  :associative?      (and (:associative? old-fold)
@@ -446,36 +594,40 @@
   ([state fold chunks i]
    (make-linear-reduce-task state fold chunks i ::first))
   ([state {:keys [reducer-identity, reducer]} chunks i prev-reduce]
-   (task/submit state
-                [:reduce i]
-                (if (= i 0) [] [prev-reduce])
-                (fn task [in]
-                  ; (info "Linear reduce" i (first in))
-                  (let [acc (if (= i 0)
-                              (reducer-identity)
-                              (first in))]
-                    (c/reduce reducer acc (nth chunks i)))))))
+   ; In order to support early return, we need to know if the reduction on a
+   ; single chunk reduced early or not.
+   (let [reducer (reduced-wrapper reducer)]
+     (task/submit state
+                  [:reduce i]
+                  (if (= i 0) [] [prev-reduce])
+                  (fn task [in]
+                    ; (info "Linear reduce" i (first in))
+                    (let [acc (if (= i 0)
+                                (reducer-identity)
+                                (first in))]
+                      (if (reduced? acc)
+                        acc
+                        (c/reduce reducer acc (nth chunks i)))))))))
 
 (defn make-linear-combine-task
   "Takes a task executor state, a fold, chunks, and the final reduce task.
   Returns [state' task] where task is a new task which applies the post-reduce
-  to the last reduced value, then performs a single combine"
+  to the last reduced value, then performs a single combine. Or, if combiner is
+  not provided, just does post-reduce."
   [state {:keys [reducer-identity reducer post-reducer combiner-identity
                  combiner]} chunks last-reduce]
   (task/submit state
                [:combine]
                [last-reduce]
-               (if (and (identical? reducer-identity
-                                    combiner-identity)
-                        (identical? reducer combiner))
-                 ; There's actually no need to do a combine here; we can just
-                 ; pass on our only input unchanged.
-                 first
-                 ; Do a trivial combine
-                 (fn task [[reduce-acc]]
-                   ; (info "Linear combine" reduce-acc)
-                   (combiner (combiner-identity)
-                             (post-reducer reduce-acc))))))
+               (fn task [[reduce-acc]]
+                 ; Unwrap reduced
+                 (let [reduce-acc   (unreduced reduce-acc)
+                       post-reduced (post-reducer reduce-acc)]
+                   (if combiner
+                     ; Do a trivial combine
+                     (combiner (combiner-identity) post-reduced)
+                     ; Done
+                     post-reduced)))))
 
 ;; Concurrent fold tasks
 
@@ -491,22 +643,23 @@
   though we *could* rush ahead and launch every reduce concurrently, we inject
   dependencies between reduce tasks forming a tree: the first chunk unlocks the
   second and third, which unlock the fourth through seventh, and so on."
-  [state {:keys [asap? reducer-identity, reducer, post-reducer]} chunks
-   prev-reduce-tasks i]
-  (let [ordering-dep (when (and (not asap?)
-                                (seq prev-reduce-tasks))
-                       (nth prev-reduce-tasks
-                            (long (/ (count prev-reduce-tasks)
-                                     concurrent-reduce-task-unlock-factor))))]
+  [state {:keys [asap? reducer-identity, reducer, post-reducer]}
+   chunks prev-reduce-tasks i]
+  (let [ordering-deps
+        (when (and (not asap?)
+                   (seq prev-reduce-tasks))
+          [(nth prev-reduce-tasks
+                (long (/ (count prev-reduce-tasks)
+                         concurrent-reduce-task-unlock-factor)))])]
     (task/submit state
                  [:reduce i]
-                 (when ordering-dep [ordering-dep])
+                 ordering-deps
                  (fn task [_]
                    ; (info :reduce i)
-                   (post-reducer
-                     (c/reduce reducer
-                               (reducer-identity)
-                               (nth chunks i)))))))
+                   (let [acc (c/reduce reducer
+                                       (reducer-identity)
+                                       (nth chunks i))]
+                     (post-reducer acc))))))
 
 (defn make-concurrent-combine-task
   "Takes a task executor state, a fold, chunks, a chunk index, and either:
@@ -523,7 +676,6 @@
                 (fn first-task [[post-reduced]]
                   ; (info :first-combine i post-reduced)
                   (let [res (combiner (combiner-identity) post-reduced)]
-                    ;(info :combine i res)
                     res))))
   ([state {:keys [combiner post-combiner]} chunks i
     prev-combine-task reduce-task]
@@ -532,9 +684,13 @@
                 [prev-combine-task reduce-task]
                 (fn task [[prev-combine post-reduced]]
                   ; (info :combine i prev-combine post-reduced)
-                  (let [res (combiner prev-combine post-reduced)]
-                    ;(info :combine i res)
-                    res)))))
+                  (if (reduced? prev-combine)
+                    ; Early return; skip this chunk
+                    ; TODO: we might want to use state to bypass later
+                    ; reductions, since they aren't used.
+                    prev-combine
+                    (let [res (combiner prev-combine post-reduced)]
+                      res))))))
 
 ; Tasks which work for both linear and concurrent folds
 
@@ -545,7 +701,7 @@
   delivers results to the output of a fold. Returns [state' task], where task
   applies the post-combiner of the fold and calls deliver-fn with the results.
 
-  Can also take an optional fold Executor; we clean up old passes automatically
+  Can also take an optional Folder; we clean up old passes automatically
   once delivery occurs."
   ([state fold task deliver-fn]
    (make-deliver-task state fold task deliver-fn nil))
@@ -556,8 +712,14 @@
                       [task]
                       (fn deliver [[combined]]
                         ; (info :deliver combined)
-                        (deliver-fn (post-combiner combined))
-                        (when executor (clear-old-passes! executor))))
+                        (try
+                          (let [combined (unreduced combined)
+                                res (if post-combiner
+                                      (post-combiner combined)
+                                      combined)]
+                            (deliver-fn res))
+                          (finally
+                            (when executor (clear-old-passes! executor))))))
          ; If something goes wrong in our pipeline, we deliver a CapturedThrow
          ; instead.
          [state catch-task]
@@ -646,7 +808,7 @@
   the given fold."
   [fold chunks]
   (let [fold-type (or (:pass-type fold)
-                      (if (:associative? fold)
+                      (if (:combiner fold)
                         :concurrent
                         :linear))
         result (promise)]
@@ -821,7 +983,7 @@
   [state old-pass new-pass]
   (let [chunks (:chunks old-pass)
         n      (count chunks)
-        _      (assert (identical? chunks (:chunks new-pass)))
+        ;_      (assert (identical? chunks (:chunks new-pass)))
         old-fold (:fold old-pass)
         new-fold (:fold new-pass)
         ;_ (info (str "Joining linear pass " (:name old-fold) " with "
@@ -943,7 +1105,7 @@
         ; accumulators/reducers.
         chunks               (:chunks old-pass)
         n                    (count chunks)
-        _                    (assert (identical? chunks (:chunks new-pass)))
+        ;_                    (assert (identical? chunks (:chunks new-pass)))
         old-fold             (:fold old-pass)
         new-fold             (:fold new-pass)
         ; Fuse folds
@@ -1284,30 +1446,42 @@
     :concurrent (join-concurrent-pass state old-pass new-pass)))
 
 (declare fold)
-(deftype Executor [^jepsen.history.task.Executor task-executor
-                   history
-                   passes]
+(deftype Folder [^jepsen.history.task.Executor task-executor
+                 chunks
+                 passes]
   IReduce
   (reduce [this f]
-    (fold this (reduce->fold f)))
+    (fold this (assoc (make-fold f) :name :reduce)))
 
   IReduceInit
   (reduce [this f init]
-    (fold this (reduce->fold f init))))
+    (fold this (assoc (make-fold f)
+                      :name             :reduce
+                      :reducer-identity (constantly init))))
 
-(defn executor
-  "Starts a new executor for folds over the given chunkable history."
-  [history]
-  (Executor. (task/executor)
-             history
-             (atom {:concurrent nil
-                    :linear     nil})))
+  clojure.core.reducers/CollFold
+  (coll-fold [this n combinef reducef]
+    (fold this (assoc (make-fold reducef combinef)
+                      :name          :coll-fold
+                      ; Not as useful, but I think compatibility is probably
+                      ; more important
+                      :post-reducer  identity
+                      :post-combiner identity
+                      :associative?  true))))
+
+(defn folder
+  "Creates a new stateful Folder for folds over the given chunkable."
+  [chunkable]
+  (Folder. (task/executor)
+           (hc/chunks chunkable)
+           (atom {:concurrent nil
+                  :linear     nil})))
 
 (defn clear-old-passes!
-  "Takes an Executor and clears out any old pass state."
-  [^Executor e]
-  (let [task-executor (.task-executor e)]
-    (swap! (.passes e)
+  "Takes a Folder and clears out any old pass state."
+  [^Folder f]
+  (let [task-executor (.task-executor f)]
+    (swap! (.passes f)
            (fn clear [passes]
              (let [state (task/executor-state task-executor)]
                ;(info :passes (with-out-str (pprint passes)))
@@ -1327,26 +1501,25 @@
                       (do ;(info :cleared-passes (with-out-str (pprint passes')))
                           passes')))))))
 
-(defn executor-pass
-  "Takes a history executor and a fold. Turns the fold into a pass, ready for
-  execution on this executor."
-  [^Executor e fold]
-  (let [exec    (.task-executor e)
-        history (.history e)
-        chunks  (hc/chunks history)
+(defn folder-pass
+  "Takes a Folder and a fold. Turns the fold into a pass, ready for
+  execution on this folder."
+  [^Folder f fold]
+  (let [exec    (.task-executor f)
+        chunks  (.chunks f)
         pass    (pass fold chunks)]
     ; We'll want this so we can clear old pass state later.
-    (assoc pass :executor e)))
+    (assoc pass :folder f)))
 
 (defn run-pass!
-  "Takes a history executor and a pass. Launches the pass on the executor,
+  "Takes a folder and a pass. Launches the pass on the folder,
   joining it to an existing pass if possible. Returns newly-running pass."
-  [^Executor e new-pass]
+  [^Folder f new-pass]
   ; If we lose a CAS loop here we could pay a huge performance penalty by
   ; missing an opportunity to join a running pass. We take a full lock.
-  (locking e
-    (let [exec           (.task-executor e)
-          passes         (.passes e)
+  (locking f
+    (let [exec           (.task-executor f)
+          passes         (.passes f)
           resulting-pass (volatile! nil)
           pass-type      (:type new-pass)]
       (task/txn! exec
@@ -1365,11 +1538,11 @@
         pass))))
 
 (defn run-fold!
-  "Takes an Executor and a fold. Runs the fold, returning a deref-able output."
-  [executor fold]
-  (let [pass   (executor-pass executor fold)
+  "Takes a Folder and a fold. Runs the fold, returning a deref-able output."
+  [folder fold]
+  (let [pass   (folder-pass folder fold)
         result (:result pass)
-        pass'  (run-pass! executor pass)]
+        pass'  (run-pass! folder pass)]
     ;(info "Running pass" (pr-str
     ;                       (-> pass'
     ;                           (dissoc :deliver :result :chunks)
@@ -1385,51 +1558,47 @@
 
 (defn empty-fold
   "Runs a fold over zero elements."
-  [{:keys [combiner-identity post-combiner]}]
-  (post-combiner (combiner-identity)))
-
-(defn validate-fold
-  "Throws if fold is malformed. Returns fold otherwise."
   [fold]
-  (when-not (:name fold)
-    (throw+ {:type ::no-name, :fold fold}))
-  (when-not (fn? (:reducer-identity fold))
-    (throw+ {:type :no-reducer-identity, :fold fold}))
-  (when-not (fn? (:reducer fold))
-    (throw+ {:type :no-reducer, :fold fold}))
-  (when-not (fn? (:post-reducer fold))
-    (throw+ {:type :no-post-reducer, :fold fold}))
-  (when-not (fn? (:combiner-identity fold))
-    (throw+ {:type :no-combiner-identity, :fold fold}))
-  (when-not (fn? (:combiner fold))
-    (throw+ {:type :no-combiner, :fold fold}))
-  (when-not (fn? (:post-combiner fold))
-    (throw+ {:type :no-post-combiner, :fold fold}))
-  fold)
+  (if (:combiner fold)
+    ((:post-combiner fold) ((:combiner-identity fold)))
+    ((:post-reducer fold)  ((:reducer-identity fold)))))
 
 (defn pfold
-  "Executes a fold on the given executor asynchronously. Returns a
-  deref-able result."
-  [^Executor executor fold]
-  (validate-fold fold)
-  (let [chunks      (hc/chunks (.history executor))
+  "Executes a fold on the given folder asynchronously. See `make-fold` for
+  what a fold can be. Returns a deref-able result."
+  [^Folder folder fold]
+  (let [fold        (-> fold make-fold validate-fold)
+        chunks      (.chunks folder)
         chunk-count (count chunks)]
     (condp = chunk-count
       ; No chunks
       0 (doto (promise) (deliver (empty-fold fold)))
 
       ; For single chunks, no sense in combining
-      ; 1 (run-fold! executor (assoc fold :pass-type :linear))
+      ; 1 (run-fold! folder (assoc fold :pass-type :linear))
 
       ; Some chunks
-      (run-fold! executor fold))))
+      (run-fold! folder fold))))
 
 (defn fold
-  "Executes a fold on the given executor synchronously. Returns result of the
-  fold."
-  [executor fold]
+  "Executes a fold on the given folder synchronously. See `make-fold` for
+  what a fold can be. Returns result of the fold.
+
+  This is the opposite arity from (reduce f coll): here we're sort of saying
+  (fold coll f). I've thought long and hard about this, and I think it makes
+  sense. With `reduce`, you're generally composing a collection and passing it
+  to `reduce`. With `fold`, you're generally composing a *fold* and executing
+  it on the same folder over and over. This feels like it's going to be more
+  ergonomic."
+  [folder fold]
   (task/throw-captured
-    (let [result (pfold executor fold)]
+    (let [result (pfold folder fold)]
       ; (info :fold :result result)
-      ;(pfold executor fold))
-      (deref (pfold executor fold) 1000 :timeout))))
+      @result)))
+
+(defn tesser
+  "Shortcut for running a Tesser uncompiled fold on a folder."
+  [folder tesser-fold]
+  (->> tesser-fold
+       tesser/compile-fold
+       (fold folder)))

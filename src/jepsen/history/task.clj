@@ -555,7 +555,7 @@
    (assert+ (instance? ITask dep)
             (str "Dependency must be a task, but got " (pr-str dep)))
    (let [task  (Catch. (.next-task-id state) name data (.id dep) f
-                       (.output dep) (promise) (.executor state))
+                       (.output ^InternalTask dep) (promise) (.executor state))
          dep-graph (add-dep-edge (.dep-graph state) dep task)]
      (add-task-helper state dep-graph task))))
 

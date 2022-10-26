@@ -105,7 +105,14 @@
 (deftype Chunked [chunks]
   Chunkable
   (chunks [this]
-    chunks))
+    chunks)
+
+  clojure.lang.IReduceInit
+  (reduce [this f init]
+    (reduce (fn [acc chunk]
+              (reduce f acc chunk))
+            init
+            chunks)))
 
 (defn chunked
   "Takes a collection of chunks and creates a Chunked wrapper around them. Or,

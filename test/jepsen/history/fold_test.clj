@@ -33,32 +33,99 @@
 
 ;; Simple example-based tests
 
-(deftest ^:focus basic-test
+(deftest basic-test
   (let [dogs [{:legs 6, :name :noodle},
               {:legs 4, :name :stop-it},
               {:legs 4, :name :brown-one-by-the-fish-shop}]
         chunked-dogs (hc/chunked 2 dogs)
-        e (f/executor chunked-dogs)]
+        f (f/folder chunked-dogs)]
     (testing "reduce"
       (is (= 6 (reduce (fn reduce-test
                          ([] 0)
                          ([max-legs dog]
                           (max max-legs (:legs dog))))
-                       e))))
+                       f))))
     (testing "reduce init"
       (is (= 6 (reduce (fn reduce-init-test [max-legs dog]
                          (max max-legs (:legs dog)))
                        0
-                       e))))
+                       f))))
 
     (testing "transduce"
       (let [xf (comp (map :name)
                      (remove #{:stop-it}))]
         (is (= [:noodle :brown-one-by-the-fish-shop]
-               (transduce xf conj [] e)))))
+               (transduce xf conj [] f)))))
 
     (testing "into"
-      (is (= #{4 6} (into #{} (map :legs) e))))))
+      (is (= #{4 6} (into #{} (map :legs) f))))))
+
+(deftest reduced-test
+  (let [f (f/folder (hc/chunked 2 [1 2 3 4 5 6]))]
+    (testing "linear"
+      (is (= 2
+             (reduce (fn [_ x]
+                       (if (even? x)
+                         (reduced x)
+                         x))
+                     nil
+                     f))))
+
+    (testing "concurrent"
+      (is (= 4
+             (f/fold f {:reducer-identity (constantly nil)
+                        :reducer (fn [_ x]
+                                   (if (< 3 x)
+                                     (reduced x)
+                                     x))
+                        ; Reductions yield [2 4 5]
+                        :combiner-identity (constantly nil)
+                        :combiner (fn [_ x]
+                                    (if (< 2 x)
+                                      (reduced x)
+                                      x))}))))
+    ))
+
+(deftest make-fold-test
+  (let [xs (hc/chunked 2 [1 3 5 2 4])
+        f  (f/folder xs)]
+    (testing "just f"
+      ; + has all 3 arities
+      (is (= 15 (f/fold f +)))
+      ; But we can also provide a fn without a post-reducer
+      (is (= #{1 3 5 2 4} (f/fold f (fn ([] #{}) ([s x] (conj s x)))))))
+
+    (testing "two fns"
+      (is (= ",(3 1),(2 5),(4)!"
+             (f/fold f (f/make-fold
+                         (fn ([] ())
+                           ([xs x] (conj xs x))
+                           ([xs] (str xs)))
+                         (fn ([] "")
+                           ([s x] (str s "," x))
+                           ([s] (str s "!"))))
+                     ))))
+
+    (testing "map"
+      (is (= '(4 2 5 3 1)
+             (f/fold f{:reducer-identity list
+                       :reducer          conj}
+                     )))
+      (is (= 6
+             (f/fold f {:reducer-identity (constantly 0)
+                        :reducer          max
+                        :post-reducer     inc}
+                     ))))
+
+    (testing "tesser"
+      ; A little weird: Tesser's take is unordered, but we're relying on the
+      ; particular way its reducer/combiner work here.
+      (is (= #{0 1 2}
+             (->> (tesser/map dec)
+                  (tesser/take 3)
+                  (tesser/into #{})
+                  (f/tesser f)))))
+    ))
 
 ;; Generative tests
 
@@ -136,7 +203,10 @@
     {:name              name
      :associative?      true
      :asap?             true
-     :model             (fn model [_ _ _] name)
+     :model             (fn model [fold _ _]
+                          (if (:combiner fold)
+                            name
+                            postred))
      :reducer-identity (constantly red)
      :reducer           (fn reducer [acc _]
                           (assert (identical? acc red))
@@ -168,10 +238,12 @@
    :associative?  true
    :asap?            true
    :model (fn [fold chunk-size dogs]
-            (if (seq dogs)
-              (/ (reduce + 0 (map :cuteness dogs))
-                 (count dogs))
-              :nan))
+            (if (:combiner fold)
+              (if (seq dogs)
+                (/ (reduce + 0 (map :cuteness dogs))
+                   (count dogs))
+                :nan)
+              [(count dogs) (reduce + (map :cuteness dogs))]))
    ; [sum count]
    :reducer-identity (constantly [0 0])
    :reducer (fn [[sum count] dog]
@@ -277,22 +349,30 @@
                     [((:model old-fold) fold chunk-size dogs)
                      ((:model new-fold) fold chunk-size dogs)]))))
 
-(def basic-fold-gen
-  "Makes a random, basic fold over dogs"
-  (gen/let [asap? gen/boolean
-            fold (gen/one-of
-                   [fold-type-gen
-                    fold-count-gen
-                    fold-mean-cuteness-gen
-                    fold-mut-legs-gen])]
-    (assoc fold :asap? asap?)))
-
+(defn basic-fold-gen
+  "Makes a generator of a random, basic fold over dogs. If given combiner?,
+  ensures folds either do or don't have a combiner."
+  ([]
+   (gen/let [combiner? gen/boolean]
+     (basic-fold-gen combiner?)))
+  ([combiner?]
+   (gen/let [asap? gen/boolean
+             fold (gen/one-of
+                    [fold-type-gen
+                     fold-count-gen
+                     fold-mean-cuteness-gen
+                     fold-mut-legs-gen])]
+     (cond-> (assoc fold :asap? asap?)
+       (not combiner?) (dissoc fold
+                               :combiner :combiner-identity :post-combiner)))))
 
 (def fold-gen
-  "Makes a (possibly recursively fused) fold over dogs."
-  (gen/recursive-gen (fn [fold-gen]
-                       (fold-fuse-gen fold-gen fold-gen))
-                     basic-fold-gen))
+  "Makes a (possibly recursively fused) fold over dogs. Either every fold will
+  have a combiner, or none will."
+  (gen/let [combiner? gen/boolean]
+    (gen/recursive-gen (fn [fold-gen]
+                         (fold-fuse-gen fold-gen fold-gen))
+                       (basic-fold-gen combiner?))))
 
 (defn slow-fold-gen
   "Takes a fold gen and makes its reducers slow."
@@ -699,12 +779,15 @@
         ;_    (info :reduced reduced)
         post-reduced (post-reducer reduced)
         ;_ (prn :post-reduced (f/ary->vec post-reduced))
-        combined (combiner (combiner-identity) post-reduced)
-        ;_ (prn :combined (f/ary->vec combined))
-        post-combined (post-combiner combined)
-        ;_ (prn :post-combined post-combined)
         ]
-    post-combined))
+    (if-not combiner
+      post-reduced
+      (let [combined (combiner (combiner-identity) post-reduced)
+            ;_ (prn :combined (f/ary->vec combined))
+            post-combined (post-combiner combined)
+            ;_ (prn :post-combined post-combined)
+            ]
+        post-combined))))
 
 (defn secs
   "Nanos to seconds"
@@ -712,10 +795,10 @@
   (float (/ nanos 1000000000)))
 
 (defn test-fold
-  "Runs fold on executor, returning a test.check Result"
-  [executor chunk-size dogs fold]
+  "Runs fold on folder, returning a test.check Result"
+  [folder chunk-size dogs fold]
   (let [t0 (System/nanoTime)
-        exec-res   (f/fold executor fold)
+        exec-res   (f/fold folder fold)
         t1 (System/nanoTime)
         model-res  ((:model fold) fold chunk-size dogs)
         t2 (System/nanoTime)
@@ -743,20 +826,20 @@
                                          (inc (/ size 10)))
                                          small-pos-int)
                  fold       fold-gen]
-                (let [executor   (f/executor (hc/chunked chunk-size dogs))]
-                  (test-fold executor chunk-size dogs fold))))
+                (let [folder   (f/folder (hc/chunked chunk-size dogs))]
+                  (test-fold folder chunk-size dogs fold))))
 
-; Submits a bunch of folds at the same time to a single executor. Stress-tests
+; Submits a bunch of folds at the same time to a single folder. Stress-tests
 ; all the concurrency safety!
 (defspec fold-equiv-parallel n
   (prop/for-all [dogs       dogs-gen
                  chunk-size (gen/scale (fn [size]
                                          (inc (/ size 10)))
                                          small-pos-int)
-                 folds      (gen/vector basic-fold-gen)]
-                (let [executor (f/executor (hc/chunked chunk-size dogs))
+                 folds      (gen/vector (basic-fold-gen))]
+                (let [folder (f/folder (hc/chunked chunk-size dogs))
                       results  (real-pmap
-                                 (partial test-fold executor chunk-size dogs)
+                                 (partial test-fold folder chunk-size dogs)
                                  folds)]
                   (all-results results))))
 
@@ -764,15 +847,13 @@
 (defspec ^:slow fold-equiv-parallel-lorge n
   (let [dog-count 100000000]
     (prop/for-all [dogs       (gen/not-empty dogs-gen)
-                   folds      (gen/not-empty (gen/vector basic-fold-gen))]
-                  ; Just for now, cuz all I implemented was concurrent folds
-                  (let [folds (mapv #(assoc % :associative? true) folds)
-                        dogs  (vec (take dog-count (cycle dogs)))
+                   folds      (gen/not-empty (gen/vector (basic-fold-gen)))]
+                  (let [dogs  (vec (take dog-count (cycle dogs)))
                         chunk-size (long (/ (count dogs) 64))]
                     ; (info "parallel dogs" (count dogs) "chunk-size" chunk-size
                     ;      "folds" (mapv :name folds))
-                    (let [executor (f/executor (hc/chunked chunk-size dogs))
-                          results  (real-pmap (partial test-fold executor
+                    (let [folder (f/folder (hc/chunked chunk-size dogs))
+                          results  (real-pmap (partial test-fold folder
                                                        chunk-size dogs)
                                      folds)]
                       (all-results results))))))
@@ -786,14 +867,14 @@
                              (inc (/ size 10)))
                            small-pos-int)
      folds      (gen/vector fold-call-count-gen)]
-    (let [executor (f/executor (hc/chunked chunk-size dogs))
+    (let [folder (f/folder (hc/chunked chunk-size dogs))
           n        (count dogs)
-          results  (real-pmap (partial f/fold executor) folds)]
+          results  (real-pmap (partial f/fold folder) folds)]
       (all-results
         (map (fn [fold {:keys [reducer-identity reducer post-reducer
                                combiner-identity combiner post-combiner]
                         :as result}]
-               (let [c (if (:associative? fold)
+               (let [c (if (:combiner fold)
                          (long (Math/ceil (/ n chunk-size)))
                          1)]
                  (reify Result
@@ -813,49 +894,61 @@
              folds
              results)))))
 
-; This one's *just* for perf testing. Spews JSON to a file then folds over it as if it were tons of files.
-(deftest ^:perf fold-parallel-perf
-  ; ten million dogs might be enough -- nona, probably
-  (let [dog-count   1e7
-        chunk-count 100
+(def dogs-dir         "dogs")
+(def dogs-sample-file (str dogs-dir "/sample.json"))
+(def dogs-file        (str dogs-dir "/dogs.json"))
+
+(defn on-demand-reducible
+  "A reducible which invokes (make-coll) to get a collection every time it
+  reduces. Simulates what you might do for parsing files on disk without
+  retaining the head."
+  [make-coll]
+  (reify clojure.lang.IReduceInit
+    (reduce [this f init]
+      (reduce f init (make-coll)))))
+
+(defn gen-dogs-file!
+  "Spits out a file dogs/dogs.json with lots of random dogs, and returns a lazy
+  chunked collection of `dog-count` dogs in all, backed by that file."
+  [dog-count]
+  (let [chunk-count 200
         dogs-per-file (Math/ceil (/ dog-count chunk-count))
         sample-size 1e4
         samples-per-file (Math/ceil (/ dogs-per-file sample-size))
         ; Generate just a few for interest
         dog-sample (gen/sample dog-gen sample-size)
         ; Write a file with the sample
-        dir         "dogs"
-        sample-file (str dir "/sample.json")
-        dogs-file   (str dir "/dogs.json")
-        ; WARNING: Uncomment this if you change the tuning parameters above, or
-        ; delete the file yourself.
         _ (io/delete-file dogs-file true)
         _ (when-not (.exists (io/file dogs-file))
             (info "Making small JSON sample")
-            (io/make-parents sample-file)
-            (with-open [w (io/writer sample-file)]
+            (io/make-parents dogs-sample-file)
+            (with-open [w (io/writer dogs-sample-file)]
               (doseq [dog dog-sample]
                 (json/generate-stream dog w)
                 (.write w "\n")))
             (info "Making that sample... large")
             (dotimes [_ samples-per-file]
-              (sh "sh" "-c" (str "cat " sample-file " >> " dogs-file)))
-            (io/delete-file sample-file)
-            )
-        ; Set up chunks over that file. Pretend we have lots of files even
-        ; though it's just the one.
-        chunks-fn #(->> (repeat dogs-file)
-                        (take chunk-count)
-                        (map (fn [file]
-                               (json/parsed-seq (io/reader file) true)))
-                        hc/chunked)
-        exec (f/executor (chunks-fn))]
+              (sh "sh" "-c" (str "cat " dogs-sample-file " >> " dogs-file)))
+            (io/delete-file dogs-sample-file))
+        chunks (->> (repeat dogs-file)
+                    (take chunk-count)
+                    (mapv (fn [file]
+                            (on-demand-reducible
+                              (fn load-chunk []
+                                (json/parsed-seq (io/reader file) true)))))
+                    hc/chunked)]
+    chunks))
+
+; This one's *just* for perf testing. Spews JSON to a file then folds over it as if it were tons of files.
+(deftest ^:perf fold-parallel-perf
+  ; ten million dogs might be enough -- nona, probably
+  (let [dog-count   1e7
+        dogs (gen-dogs-file! dog-count)
+        exec (f/folder dogs)]
     (dotimes [i 1]
       ; Do a pass!
-      (let [folds (->> (gen/sample basic-fold-gen 10)
+      (let [folds (->> (gen/sample (basic-fold-gen) 10)
                        (mapv #(assoc %
-                                     ; Assoc is faster
-                                     :associative? true
                                      ; ASAP slower for multiple folds
                                      :asap? false)))
             _ (println "Starting concurrent folds" (pr-str (map :name folds)))
@@ -873,11 +966,10 @@
                              (prn :fold (:name fold))
                              (apply-fold-with-reduce
                                fold
-                               (apply concat (hc/chunks (chunks-fn)))))
+                               dogs))
                            folds)
             t1 (System/nanoTime)
             _ (println "Finished serial folds in " (secs (- t1 t0)) " seconds")
             _ (prn (mapv :name folds))
             _ (binding [*print-length* 4] (prn results1))
             ]))))
-
