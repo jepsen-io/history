@@ -93,7 +93,10 @@
   results."
   (:refer-clojure :exclude [map filter remove])
   (:require [clojure [core :as c]
-                     [pprint :refer [pprint]]]
+                     [pprint :as pprint :refer [pprint
+                                                pprint-logical-block
+                                                pprint-newline
+                                                print-length-loop]]]
             [clojure.core.reducers :as r]
             [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ loopr]]
@@ -102,6 +105,7 @@
             [potemkin :refer [def-abstract-type
                               definterface+
                               deftype+]]
+            [slingshot.slingshot :refer [try+ throw+]]
             [tesser [core :as tesser]
                     [utils :as tesser.utils]])
   (:import (clojure.core.reducers CollFold)
@@ -124,17 +128,65 @@
                                Map
                                Maps
                                List)
+           (java.io Writer)
            (java.util Arrays)))
 
 ;; Operations
 
 (defrecord Op [^:int index ^:long time type process f value])
 
+(alter-meta! #'pprint/*current-length* #(dissoc % :private))
+(defn pprint-kv
+  "Helper for pretty-printing op fields."
+  [out k v]
+  (pprint/write-out k)
+  (.write out " ")
+  ;(pprint-newline :linear)
+  (set! pprint/*current-length* 0)
+  (pprint/write-out v)
+  (.write out ", ")
+  (pprint-newline :linear))
+
+; We're going to print a TON of these, and it's really just noise to see the Op
+; record formatting.
+; Why is this not public if you need it to print properly?
+(defmethod pprint/simple-dispatch jepsen.history.Op
+  [op]
+  (let [^Writer out *out*]
+  ; See https://github.com/clojure/clojure/blob/5ffe3833508495ca7c635d47ad7a1c8b820eab76/src/clj/clojure/pprint/dispatch.clj#L105
+    (pprint-logical-block :prefix "{" :suffix "}"
+      (pprint-kv out :process (.process op))
+      (pprint-kv out :type    (.type op))
+      (pprint-kv out :f       (.f op))
+      (pprint-kv out :value   (.value op))
+      ; Other fields
+      (print-length-loop [pairs (seq (.__extmap op))]
+        (when pairs
+          (pprint-logical-block
+            (pprint/write-out (ffirst pairs))
+            (.write out " ")
+            (pprint-newline :linear)
+            (pprint/write-out (fnext (first pairs))))
+          (when-let [pairs' (next pairs)]
+            (.write out ", ")
+            (pprint-newline :linear)
+            (recur pairs'))))
+      ; Always at the end
+      (pprint-kv out :index   (.index op))
+      (pprint-kv out :time    (.time op))
+    )))
+
+(defmethod print-method jepsen.history.Op [op ^java.io.Writer w]
+  (.write w (str (into {} op))))
+
 (defn op
   "Constructs an operation. With one argument, expects a map, and turns that
-  map into an Op record, which is somewhat faster to work with."
+  map into an Op record, which is somewhat faster to work with. If op is
+  already an Op, returns it unchanged."
   [op]
-  (map->Op op))
+  (if (instance? Op op)
+    op
+    (map->Op op)))
 
 (defn invoke?
   "Is this op an invocation?"
@@ -165,6 +217,26 @@
   "Is this an operation from a client? e.g. does it have an integer process."
   [op]
   (integer? (:process op)))
+
+(defn assert-invoke+
+  "Throws if something is not an invocation, or, for non-client operations, an
+  info. Otherwise returns op."
+  [op]
+  (assert+ (or (invoke? op)
+               ; Non-clients are allowed to invoke with :info
+               (and (not (client-op? op))
+                    (info? op)))
+           IllegalArgumentException
+           (str "Expected an invocation, but got " (pr-str op)))
+  op)
+
+(defn assert-complete
+  "Throws if something is not a completion. Otherwise returns op."
+  [op]
+  (assert+ (not (invoke? op))
+           IllegalArgumentException
+           (str "Expected a completion, but got " (pr-str op)))
+  op)
 
 ;; Common folds
 
@@ -251,7 +323,7 @@
      ; Finish off running ops with nil
      (loopr [pairs' pairs]
             [op (.values running)]
-            (recur (.put pairs' (:index op) nil))
+            (recur (.put pairs' (:index op) -1))
             (.forked pairs')))})
 
 ;; Histories
@@ -261,11 +333,12 @@
                   "Returns true if indexes in this history are 0, 1, 2, ...")
 
   (get-index [history ^long index]
-             "Returns the operation with the given index in this history.
-             For densely indexed histories, this is just like `nth`. For sparse
-             histories, it may not be the nth op!")
+             "Returns the operation with the given index in this history, or
+             nil if that operation is not present. For densely indexed
+             histories, this is just like `nth`. For sparse histories, it may
+             not be the nth op!")
 
-  (^long pair-index [history index]
+  (^long pair-index [history ^long index]
          "Given an index, returns the index of that operation's
          corresponding invocation or completion. -1 means no match.")
 
@@ -284,6 +357,86 @@
           "Executes a Tesser fold on this history. See history.fold/tesser for
           details."))
 
+(def-abstract-type AbstractHistory
+  History
+  (completion [this invocation]
+              (assert-invoke+ invocation)
+              (let [i (.pair-index this (:index invocation))]
+                (when-not (= -1 i)
+                  (.get-index this i))))
+
+  (invocation [this completion]
+              (assert-complete completion)
+              (let [i (.pair-index this (:index completion))]
+                (when-not (= -1 i)
+                  (.get-index this i)))))
+
+(defn add-dense-indices
+  "Adds sequential indices to a series of operations. Throws if there are
+  existing indices that wouldn't work with this."
+  [ops]
+  (if (and (instance? History ops)
+           (dense-indices? ops))
+    ; Already checked
+    ops
+    ; Go through em
+    (loopr [ops' (transient [])
+            i    0]
+           [op ops]
+           (if-let [index (:index op)]
+             (if (not= index i)
+               (throw (ex-info {:type ::existing-different-index
+                                :i    i
+                                :op   op}))
+               (recur (conj! ops' op) (inc i)))
+             (recur (conj! ops' (assoc op :index i))
+                    (inc i)))
+           (persistent! ops'))))
+
+(defn assert-indices
+  "Ensures every op has an :index field. Throws otherwise."
+  [ops]
+  (if (instance? History ops)
+    ops
+    (loopr []
+           [op ops]
+           (do (when-not (integer? (:index op))
+                 (throw+ {:type ::no-integer-index
+                          :op op}))
+               (recur))
+           ops)))
+
+(defn preprocess-ops
+  "When we prepare a history around some operations, we need to ensure they
+  have indexes, belong to indexed collections, and so on. This takes a
+  collection of ops, and optionally an option map, and returns processed ops.
+  These ops are guaranteed to:
+
+  - Have :index fields
+  - Be records
+  - Be in a Clojure Indexed collection
+
+  Options are:
+
+    :have-indices?  If true, these ops already have :index fields.
+    :already-ops?   If true, these ops are already Op records."
+  ([ops]
+   (preprocess-ops ops {}))
+  ([ops {:keys [have-indices? already-ops?]}]
+   (let [; First, lift into an indexed collection
+         ops (if (indexed? ops)
+               ops
+               (vec ops))
+         ; Then ensure they're Ops
+         ops (if already-ops?
+               ops
+               (mapv op ops))
+         ; And that they have indexes
+         ops (if have-indices?
+               ops
+               (assert-indices ops))]
+     ops)))
+
 ;; Dense histories. These have indexes 0, 1, ..., and allow for direct,
 ;; efficient traversal.
 
@@ -297,6 +450,7 @@
    pair-index]
 
   AbstractVector
+  AbstractHistory
 
   clojure.lang.Counted
   (count [this]
@@ -331,26 +485,6 @@
 
   (pair-index [this index]
     (aget ^ints @pair-index index))
-
-  (completion [this invocation]
-    (assert+ (or (invoke? invocation)
-                 ; Non-clients are allowed to invoke with :info
-                 (and (not (client-op? invocation))
-                      (info? invocation)))
-             IllegalArgumentException
-             (str "Expected an invocation, but got " (pr-str invocation)))
-    (let [i (.pair-index this (:index invocation))]
-      (when-not (= -1 i)
-        (nth ops i))))
-
-  (invocation [this completion]
-    (assert+ (not (invoke? completion))
-             IllegalArgumentException
-             (str "Can't ask for the invocation of an invocation: "
-                  (pr-str completion)))
-    (let [i (aget ^ints @pair-index (:index completion))]
-      (when-not (= -1 i)
-        (nth ops i))))
 
   (fold [this fold]
         (f/fold folder fold))
@@ -387,59 +521,151 @@
            [^IEntry kv m]
            (let [i (.key kv)
                  j (.value kv)]
-             (if j
-               (do (aset-int ary i j)
-                   (aset-int ary j i))
-               (aset-int ary i -1))
+             (aset-int ary i j)
+             (when (not= -1 j)
+               (aset-int ary j i))
              (recur)))
     ary))
-
-(defn index-ops
-  "Adds sequential indices to a series of operations. Throws if there are
-  existing indices that wouldn't work with this."
-  [ops]
-  (if (and (instance? History ops)
-           (dense-indices? ops))
-    ; Already checked
-    ops
-    ; Go through em
-    (loopr [ops' (transient [])
-            i    0]
-           [op ops]
-           (if-let [index (:index op)]
-             (if (not= index i)
-               (throw (ex-info {:type ::existing-different-index
-                                :i    i
-                                :op   op}))
-               (recur (conj! ops' op) (inc i)))
-             (recur (conj! ops' (assoc op :index i))
-                    (inc i)))
-           (persistent! ops'))))
-
-(defn dense-history*
-  "Constructs a dense history around a collection of operations. Does not check
-  to make sure the ops are already dense; you have to do that yourself."
-  [ops]
-  (let [folder (f/folder ops)]
-    (DenseHistory. ops
-                   folder
-                   (delay (dense-history-pair-index folder)))))
 
 (defn dense-history
   "A dense history has indexes 0, 1, 2, ..., and can encode its pair index in
   an int array. You can provide a history, or a vector (or any
   IPersistentVector), or a reducible, in which case the reducible is
-  materialized to a vector."
-  [ops]
-  (let [; Materialize if necessary.
-        ops (if-not (indexed? ops)
-              ops
-              (into [] ops))
-       ops (index-ops ops)]
-    (dense-history* ops)))
+  materialized to a vector. Options are:
+
+    :have-indices?  If true, these ops already have :index fields.
+    :already-ops?   If true, these ops are already Op records.
+    :dense-indices? If true, indices are already dense, and need not be
+                    checked.
+
+  If given a history without indices, adds them."
+  ([ops]
+   (dense-history ops {}))
+  ([ops {:keys [dense-indices?] :as options}]
+   (let [ops    (preprocess-ops ops options)
+         ops    (if dense-indices?
+                  ops
+                  (add-dense-indices ops))
+         folder (f/folder ops)]
+     (DenseHistory. ops
+                    folder
+                    (delay (dense-history-pair-index folder))))))
+
+;; Sparse histories
+
+(deftype+ SparseHistory
+  [ops         ; A sparse vector-like of operations; e.g. one where indexes
+               ; aren't 0, 1, ...
+   folder      ; A folder over those ops
+   by-index    ; A delay of an IntMap which takes an op index to an offset in
+               ; ops.
+   pair-index] ; A delay of a pair index, as an IntMap.
+
+  AbstractVector
+  AbstractHistory
+
+  clojure.lang.Counted
+  (count [this]
+         (count ops))
+
+  clojure.lang.IReduceInit
+  (reduce [this f init]
+          (.reduce folder f init))
+
+  clojure.lang.Indexed
+  (nth [this i not-found]
+       (nth ops i not-found))
+
+  clojure.lang.Reversible
+  (rseq [this]
+        (rseq ops))
+
+  clojure.lang.Seqable
+  (seq [this]
+       (seq ops))
+
+  CollFold
+  (coll-fold [this n combinef reducef]
+             (r/coll-fold folder n combinef reducef))
+
+  History
+  (dense-indices? [this] false)
+
+  (get-index [this index]
+             (let [i (.get ^IntMap @by-index index -1)]
+               (when-not (= i -1)
+                 (nth ops (.get ^IntMap @by-index index -1)))))
+
+  (pair-index [this index]
+              (.get ^IntMap @pair-index index -1))
+
+  (fold [this fold]
+        (f/fold folder fold))
+
+  (tesser [this tesser-fold]
+          (f/tesser folder tesser-fold))
+
+  Iterable
+  (forEach [this consumer]
+           (.forEach ^Iterable ops consumer))
+
+  (iterator [this]
+            (.iterator ^Iterable ops))
+
+  (spliterator [this]
+               (.spliterator ^Iterable ops))
+
+  Object
+  (hashCode [this]
+            (.hashCode ops))
+
+  (toString [this]
+            (.toString ops)))
+
+(def sparse-history-by-index-fold
+  "A fold which computes the by-index IntMap, taking op indexes to collection
+  indexes."
+  (let [; In the reducer, we build a list of every :index encountered
+        reducer
+        (fn reducer
+          ([] (.linear (List.)))
+          ([^IList indices, op]
+           (.addLast indices (:index op))))
+        ; And in the combiner, we stitch those into a reverse-indexed map,
+        ; keeping track of the starting index of each chunk.
+        combiner
+        (fn combiner
+          ([] [0 (.linear (IntMap.))])
+          ([[i, ^IntMap m]] (.forked m))
+          ([[^long i, ^IntMap m] chunk-indices]
+           (loopr [j  0
+                   m' m]
+                  [index chunk-indices]
+                  (recur (inc j) (.put m' index (+ i j)))
+                  [(+ i j) m])))]
+    {:name     :sparse-history-by-index
+     :reducer  reducer
+     :combiner combiner}))
+
+(defn sparse-history
+  "Constructs a sparse history backed by the given collection of ops. Options:
+
+    :have-indices?  If true, these ops already have :index fields.
+    :already-ops?   If true, these ops are already Op records."
+  ([ops]
+   (sparse-history ops {}))
+  ([ops options]
+   (let [ops        (preprocess-ops ops options)
+         folder     (f/folder ops)
+         by-index   (delay (f/fold folder sparse-history-by-index-fold))
+         pair-index (delay (f/fold folder pair-index-fold))]
+     (SparseHistory. ops folder by-index pair-index))))
+
+;; Mapped histories
 
 (deftype+ MappedHistory [history map-fn]
   AbstractVector
+  AbstractHistory
 
   clojure.lang.Counted
   (count [this]
@@ -478,27 +704,6 @@
   ; Because map-fn preserves indices, we can use our parent's pair index.
   (pair-index [this index]
               (.pair-index history index))
-
-  ; Because map-fn preserves indices, we can use our parent's pair index.
-  (completion [this invocation]
-    (assert+ (or (invoke? invocation)
-                 ; Non-clients are allowed to invoke with :info
-                 (and (not (client-op? invocation))
-                      (info? invocation)))
-             IllegalArgumentException
-             (str "Expected an invocation, but got " (pr-str invocation)))
-    (let [i (pair-index this (:index invocation))]
-      (when-not (= -1 i)
-        (.nth this i))))
-
-  (invocation [this completion]
-    (assert+ (not (invoke? completion))
-             IllegalArgumentException
-             (str "Can't ask for the invocation of an invocation: "
-                  (pr-str completion)))
-    (let [i (pair-index this (:index completion))]
-      (when-not (= -1 i)
-        (.nth this i))))
 
   (fold [this fold]
         (let [fold    (f/make-fold fold)

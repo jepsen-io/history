@@ -23,6 +23,7 @@
   (:import (io.lacuna.bifurcan IEntry
                                ISet
                                IMap
+                               IntMap
                                Map)
            (java.io StringWriter)
            (java.util ArrayList)
@@ -67,31 +68,53 @@
   "Generates a random :f for a nemesis operation"
   (gen/elements [:kill :start]))
 
+(def client-invoke-gen
+  "Makes a random client invocation"
+  (gen/let [process client-process-gen
+            f       client-f-gen
+            value   (case f
+                      :w small-pos-int
+                      :r (gen/return nil))]
+    {:type    :invoke
+     :process process
+     :f       f
+     :value   value}))
+
+(def nemesis-invoke-gen
+  "Makes a random nemesis invocation"
+  (gen/let [process nemesis-process-gen
+            f       nemesis-f-gen
+            value   (gen/elements ["n1" "n2" "n3"])]
+    {:type    :info
+     :process process
+     :f       f
+     :value   value}))
+
 (defn invoke-gen
   "Makes a random invocation"
   []
-  (gen/let [type (gen/elements [:client :nemesis])]
-    (case type
-      :client  (gen/hash-map :type (gen/return :info)
-                             :process nemesis-process-gen
-                             :f nemesis-f-gen)
-      :nemesis (gen/hash-map :type (gen/return :invoke)
-                             :process client-process-gen
-                             :f client-f-gen))))
+  (gen/one-of [client-invoke-gen nemesis-invoke-gen]))
 
 (defn complete-gen
   "Returns a generator for the given invoke op"
-  [{:keys [process f]}]
+  [{:keys [process f value]}]
   (if (number? process)
     ; Client
-    (gen/let [type (gen/elements [:ok :info :fail])]
+    (gen/let [type (gen/elements [:ok :info :fail])
+              value (case f
+                      :r (if (= type :ok)
+                           small-pos-int
+                           (gen/return nil))
+                      :w (gen/return value))]
       {:process process
        :type    type
-       :f       f})
+       :f       f
+       :value   value})
     ; Nemesis
     (gen/return {:process process
                  :type    :info
-                 :f       f})))
+                 :f       f
+                 :value   value})))
 
 (def op-pair-gen
   "Generates a pair of matched invocation and completion."
@@ -131,8 +154,44 @@
            (persistent! history))))
 
 (def ops-gen
-  "Generates a series of ops with indices"
-  (gen/fmap h/index-ops ops-gen*))
+  "Generates a series of ops with dense indices"
+  (gen/fmap h/add-dense-indices ops-gen*))
+
+(def Ops-gen
+  "Generates a vector of Op records with dense indices."
+  (gen/fmap (partial mapv h/map->Op) ops-gen))
+
+(def sparse-Ops-gen
+  "Generates a vector of ops with sparse indices"
+  (gen/let [ops   ops-gen
+            skips (gen/vector small-pos-int (count ops))]
+    (mapv (fn [op index]
+            (assoc op :index index))
+          (map h/op ops)
+          (reductions + skips))))
+
+; Some basic transforms on ops
+(defn read?
+  "Is this a read operation?"
+  [op]
+  (= :r (:f op)))
+
+(defn rewrite-op
+  "Adds a testing field to each operation and wraps the value"
+  [{:keys [process value] :as op}]
+  (assoc op
+         :process (if (integer? process)
+                    (inc process)
+                    process)
+         :value [:rewrite value]))
+
+(defn process-set
+  "A reducing fn for finding the set of all processes in a history."
+  ([] #{})
+  ([ps op]
+   (conj ps (:process op))))
+
+;; Checking indexing folds
 
 (defn model-dense-pair-index
   "A naive implementation of a dense pair index."
@@ -190,25 +249,29 @@
 
 (deftest ^:focus pair-index-spec
   (checking "pair index" n
-            [ops ops-gen]
+            [ops        ops-gen
+             chunk-size (gen/choose 1 (max 1 (count ops)))]
             (is (= (vec (model-dense-pair-index ops))
                    (vec (h/dense-history-pair-index
-                          (f/folder (hc/chunked 8 ops))))))))
+                          (f/folder (hc/chunked chunk-size ops))))))))
 
-(defn rewrite-op
-  "Adds a testing field to each operation and wraps the value"
-  [{:keys [process value] :as op}]
-  (assoc op
-         :process (if (integer? process)
-                    (inc process)
-                    process)
-         :value [:rewrite value]))
+(defn model-sparse-history-by-index
+  "A simple model of a sparse history by-index map."
+  [ops]
+  (first
+    (reduce (fn [[^IntMap m, i] op]
+              [(.put m (:index op) i) (inc i)])
+            [(IntMap.) 0]
+            ops)))
 
-(defn process-set
-  "A reducing fn for finding the set of all processes in a history."
-  ([] #{})
-  ([ps op]
-   (conj ps (:process op))))
+(deftest ^:focus sparse-history-by-index-fold-spec
+  (checking "by-index" n
+            [ops        sparse-Ops-gen
+             chunk-size (gen/choose 1 (max 1 (count ops)))]
+            (let [ops ops]
+              (is (= (model-sparse-history-by-index ops)
+                     (f/fold (f/folder (hc/chunked chunk-size ops))
+                             h/sparse-history-by-index-fold))))))
 
 (defn check-history-equiv
   "checks that two histories are equivalent."
@@ -301,6 +364,54 @@
              seq
              not))))
 
+(defn check-history
+  "Checks that something works like the given vector of operations."
+  [ops h]
+  ; Should be equivalent to underlying ops vector
+  (check-history-equiv ops h)
+
+  ; But also support get-index
+  (testing "get-index"
+    (doseq [op ops]
+      (is (identical? op (h/get-index h (:index op))))))
+
+  ; And pair operations
+  (testing "pairs"
+    (doseq [op ops]
+      (testing "symmetric"
+        (when (or (h/invoke? op)
+                  (not (h/client-op? op)))
+          (when-let [completion (h/completion h op)]
+            (is (identical? op (h/invocation h completion))))))
+      (if (h/client-op? op)
+        ; For clients, we should have an obvious invoke/complete
+        ; pair
+        (let [invoke (if (h/invoke? op)
+                       op
+                       (h/invocation h op))
+              complete (if (h/invoke? op)
+                         (h/completion h op)
+                         op)]
+          (is (h/invoke? invoke))
+          (is (not= invoke complete))
+          (when complete
+            (is (not (h/invoke? complete)))
+            (check-invoke-complete h invoke complete)))
+        ; For nemeses, we won't know which is invoke and which is
+        ; fail
+        (do (is (= :info (:type op)))
+            (let [other (h/completion h op)]
+              (when other
+                (let [[a b] (sort-by :index [op other])]
+                  (check-invoke-complete h a b))))))))
+
+  ; And folds
+  (testing "tesser"
+    (is (= (frequencies (map :f ops))
+           (->> (t/map :f)
+                (t/frequencies)
+                (h/tesser h))))))
+
 (def dense-history-gen
   "Generator of dense histories."
   (gen/let [ops ops-gen]
@@ -308,54 +419,36 @@
 
 (deftest ^:focus dense-history-test
   (checking "dense history" n
-            [ops ops-gen]
+            [ops Ops-gen]
             (let [h (h/dense-history ops)]
-              ; Should be equivalent to underlying ops vector
-              (check-history-equiv ops h)
+              (check-history ops h)
 
               (testing "indices"
                 (is (h/dense-indices? h))
                 (is (= (range (count h))
-                       (mapv :index (seq h)))))
-              (doseq [op h]
-                (testing "get-index"
-                  (is (identical? op (h/get-index h (:index op)))))
+                       (mapv :index (seq h))))))))
 
-                (testing "pairs"
-                  (testing "symmetric"
-                    (when (or (h/invoke? op)
-                              (not (h/client-op? op)))
-                      (when-let [completion (h/completion h op)]
-                        (is (identical? op (h/invocation h completion))))))
-                  (if (h/client-op? op)
-                    ; For clients, we should have an obvious invoke/complete
-                    ; pair
-                    (let [invoke (if (h/invoke? op)
-                                   op
-                                   (h/invocation h op))
-                          complete (if (h/invoke? op)
-                                     (h/completion h op)
-                                     op)]
-                      (when complete
-                        (is (h/invoke? invoke))
-                        (is (not (h/invoke? complete)))
-                        (check-invoke-complete h invoke complete)))
-                    ; For nemeses, we won't know which is invoke and which is
-                    ; fail
-                    (do (is (= :info (:type op)))
-                        (let [other (h/completion h op)]
-                          (when other
-                            (let [[a b] (sort-by :index [op other])]
-                              (check-invoke-complete h a b))))))))
+(deftest ^:focus sparse-history-test
+  (checking "clients" n
+            [ops sparse-Ops-gen]
+            (let [ops ops
+                  h   (h/sparse-history ops)]
+              (check-history ops h)
 
-              (testing "tesser"
-                (is (= (frequencies (map :f ops))
-                       (->> (t/map :f)
-                            (t/frequencies)
-                            (h/tesser h))))))))
+              (testing "indices"
+                (is (not (h/dense-indices? h)))))))
+
 
 (deftest ^:focus map-test
   (checking "rewrite" n
             [h dense-history-gen]
             (check-history-equiv (h/dense-history (mapv rewrite-op h))
                                  (h/map rewrite-op h))))
+
+#_(deftest filter-test
+  (checking "clients" n
+            [ops ops-gen]
+            (let [h (h/filter h/client-op (dense-history ops))]
+              (testing "not dense"
+                (is (not (h/dense-indices? h))))
+              (check-history (vec (filter h/client-op? ops)) h))))

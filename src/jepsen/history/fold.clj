@@ -231,19 +231,19 @@
   [fold]
   (when-not (:name fold)
     (throw+ {:type ::no-name, :fold fold}))
-  (when-not (fn? (:reducer-identity fold))
+  (when-not (ifn? (:reducer-identity fold))
     (throw+ {:type :no-reducer-identity, :fold fold}))
-  (when-not (fn? (:reducer fold))
+  (when-not (ifn? (:reducer fold))
     (throw+ {:type :no-reducer, :fold fold}))
-  (when-not (fn? (:post-reducer fold))
+  (when-not (ifn? (:post-reducer fold))
     (throw+ {:type :no-post-reducer, :fold fold}))
   ; Combiners are optional, but if you give one, you need all three fns
   (when (:combiner fold)
-    (when-not (fn? (:combiner fold))
+    (when-not (ifn? (:combiner fold))
       (throw+ {:type :no-combiner, :fold fold}))
-    (when-not (fn? (:combiner-identity fold))
+    (when-not (ifn? (:combiner-identity fold))
       (throw+ {:type :no-combiner-identity, :fold fold}))
-    (when-not (fn? (:post-combiner fold))
+    (when-not (ifn? (:post-combiner fold))
       (throw+ {:type :no-post-combiner, :fold fold})))
   fold)
 
@@ -1380,9 +1380,10 @@
 (deftype Folder [^jepsen.history.task.Executor task-executor
                  chunks
                  passes]
-  IReduce
-  (reduce [this f]
-    (fold this (assoc (make-fold f) :name :reduce)))
+  ; I think we have to special-case a single-element collection here
+  ;IReduce
+  ;(reduce [this f]
+  ;  (fold this (assoc (make-fold f) :name :reduce)))
 
   IReduceInit
   (reduce [this f init]
