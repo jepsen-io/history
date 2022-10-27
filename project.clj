@@ -16,7 +16,8 @@
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
-                   [[org.clojure/clojure "1.10.3"]
+                   [[com.gfredericks/test.chuck "0.2.13"]
+                    [org.clojure/clojure "1.10.3"]
                     [org.clojure/test.check "1.1.1"]
                     [org.slf4j/slf4j-simple "2.0.3"]
                     [cheshire "5.11.0"]

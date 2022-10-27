@@ -91,12 +91,19 @@
   This pre-emption and merging of fold passes is important: without it, we
   would need callers to block and coordinate when they actually asked for
   results."
-  (:require [clojure.core.reducers :as r]
+  (:refer-clojure :exclude [map filter remove])
+  (:require [clojure [core :as c]
+                     [pprint :refer [pprint]]]
+            [clojure.core.reducers :as r]
+            [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ loopr]]
-            [jepsen.history.core :refer [AbstractVector]]
+            [jepsen.history [core :refer [AbstractVector]]
+                            [fold :as f]]
             [potemkin :refer [def-abstract-type
                               definterface+
-                              deftype+]])
+                              deftype+]]
+            [tesser [core :as tesser]
+                    [utils :as tesser.utils]])
   (:import (clojure.core.reducers CollFold)
            (clojure.lang Associative
                          Counted
@@ -109,7 +116,15 @@
                          Indexed
                          Reversible
                          Seqable
-                         Sequential)))
+                         Sequential)
+           (io.lacuna.bifurcan IEntry
+                               IList
+                               IMap
+                               IntMap
+                               Map
+                               Maps
+                               List)
+           (java.util Arrays)))
 
 ;; Operations
 
@@ -151,6 +166,94 @@
   [op]
   (integer? (:process op)))
 
+;; Common folds
+
+(def pair-index-fold
+  "A fold which builds a pair index, as an IntMap."
+  ; In our reduce pass, we build up an IntMap partial pair index, as
+  ; well as an unmatched head and tail, each a map of processes to
+  ; completions/invocations, which should be stitched together with
+  ; neighboring chunks. Non-client ops are stored for use by the
+  ; combiner.
+  {:reducer-identity (fn reducer-identity []
+                       [(.linear (IntMap.)) ; pairs
+                        (.linear (Map.))    ; head
+                        (.linear (Map.))    ; tail
+                        (.linear (List.))]) ; non-client
+   :reducer
+   (fn reducer [[pairs head tail non-client] op]
+     (if-not (client-op? op)
+       [pairs head tail (.addLast non-client op)]
+       ; Client op
+       (let [p (:process op)]
+         (if (invoke? op)
+           ; Invoke
+           (let [invoke (.get tail p nil)]
+             (assert+ (nil? invoke)
+                      {:type    ::double-invoke
+                       :op      op
+                       :running invoke})
+             [pairs head (.put tail p op) non-client])
+           ; Complete
+           (let [invoke (.get tail p nil)
+                 i0     (:index invoke)
+                 i1     (:index op)]
+             (if invoke
+               ; Have invocation
+               [(.. pairs (put i0 i1) (put i1 i0))
+                head (.remove tail p) non-client]
+               ; Probably in the previous chunk. Put it in the head
+               (do (assert+ (not (.contains head p))
+                            {:type      ::double-complete
+                             :op        op
+                             :completed (.get head p nil)})
+                   [pairs (.put head p op) tail non-client])))))))
+   :combiner-identity (fn combiner-identity []
+                        [(.linear (IntMap.)) ; pairs
+                         (.linear (Map.))])  ; running
+   :combiner
+   (fn combiner [[^IntMap pairs, ^IMap running]
+                 [chunk-pairs head tail non-client]]
+     (let [; Merge pairs
+           pairs (.merge pairs chunk-pairs Maps/MERGE_LAST_WRITE_WINS)
+           ; Complete running operations using head
+           [pairs running]
+           (loopr [pairs'   pairs
+                   running' running]
+                  [op (.values head)]
+                  (let [p      (:process op)
+                        invoke (.get running p nil)
+                        i0     (:index invoke)
+                        i1     (:index op)]
+                    (assert+ invoke {:type ::not-running, :op op})
+                    (recur (.. pairs' (put i0 i1) (put i1 i0))
+                           (.remove running' p))))
+           ; Handle non-client ops
+           [pairs running]
+           (loopr [pairs'   pairs
+                   running' running]
+                  [op non-client]
+                  (let [p (:process op)]
+                    (if-let [invoke (.get running p nil)]
+                      ; Complete
+                      (let [i0 (:index invoke)
+                            i1 (:index op)]
+                        (recur (.. pairs' (put i0 i1) (put i1 i0))
+                               (.remove running p)))
+                      ; Begin
+                      (recur pairs' (.put running p op)))))
+
+           ; Begin running operations using tail
+           running (.merge running tail Maps/MERGE_LAST_WRITE_WINS)]
+       [pairs running]))
+   :post-combiner
+   (fn post-combiner [[pairs running]]
+     ; Finish off running ops with nil
+     (loopr [pairs' pairs]
+            [op (.values running)]
+            (recur (.put pairs' (:index op) nil))
+            (.forked pairs')))})
+
 ;; Histories
 
 (definterface+ History
@@ -162,13 +265,24 @@
              For densely indexed histories, this is just like `nth`. For sparse
              histories, it may not be the nth op!")
 
+  (^long pair-index [history index]
+         "Given an index, returns the index of that operation's
+         corresponding invocation or completion. -1 means no match.")
+
   (completion [history invocation]
               "Takes an invocation operation belonging to this history, and
               returns the operation which invoked it, or nil if none did.")
 
   (invocation [history completion]
               "Takes a completion operation and returns the operation which
-              invoked it, or nil if none did."))
+              invoked it, or nil if none did.")
+
+  (fold [history fold]
+        "Executes a fold on this history. See history.fold/fold for details.")
+
+  (tesser [history tesser-fold]
+          "Executes a Tesser fold on this history. See history.fold/tesser for
+          details."))
 
 ;; Dense histories. These have indexes 0, 1, ..., and allow for direct,
 ;; efficient traversal.
@@ -176,6 +290,8 @@
 (deftype+ DenseHistory
   [; Any vector-like collection
    ops
+   ; A folder over ops
+   folder
    ; A delayed int array mapping invocations to completions, or -1 where no
    ; link exists.
    pair-index]
@@ -188,30 +304,11 @@
 
   clojure.lang.IReduceInit
   (reduce [this f init]
-          (reduce ops f init))
+          (reduce f init ops))
 
   clojure.lang.Indexed
   (nth [this i not-found]
     (nth ops i not-found))
-
-  clojure.lang.IPersistentVector
-  (assocN [this i op]
-          ; You're not allowed to alter the process, f, or index
-          (assert+ (= i (:index op))
-                   {:type  ::wrong-index
-                    :index i
-                    :op    op})
-          (let [extant (nth this i)]
-            (assert+ (= (:process extant) (:process op))
-                     {:type ::can't-change-process
-                      :op   extant
-                      :op'  op})
-            (assert+ (= (:f extant) (:f op))
-                     {:type ::can't-change-f
-                      :op   extant
-                      :op'  op}))
-          ; But obey those rules, and the pair index is still valid!
-          (DenseHistory. (assoc op i op) pair-index))
 
   clojure.lang.Reversible
   (rseq [this]
@@ -232,21 +329,34 @@
   (get-index [this index]
     (nth ops index))
 
+  (pair-index [this index]
+    (aget ^ints @pair-index index))
+
   (completion [this invocation]
-    (assert+ (or (invoke? completion)
+    (assert+ (or (invoke? invocation)
                  ; Non-clients are allowed to invoke with :info
-                 (and (not (client-op? completion))
-                      (info? completion)))
-             IllegalArgumentException)
-    (let [i (aget ^ints @pair-index (:index invocation))]
+                 (and (not (client-op? invocation))
+                      (info? invocation)))
+             IllegalArgumentException
+             (str "Expected an invocation, but got " (pr-str invocation)))
+    (let [i (.pair-index this (:index invocation))]
       (when-not (= -1 i)
         (nth ops i))))
 
   (invocation [this completion]
-    (assert+ (not (invoke? completion)) IllegalArgumentException)
+    (assert+ (not (invoke? completion))
+             IllegalArgumentException
+             (str "Can't ask for the invocation of an invocation: "
+                  (pr-str completion)))
     (let [i (aget ^ints @pair-index (:index completion))]
       (when-not (= -1 i)
         (nth ops i))))
+
+  (fold [this fold]
+        (f/fold folder fold))
+
+  (tesser [this tesser-fold]
+          (f/tesser folder tesser-fold))
 
   Iterable
   (forEach [this consumer]
@@ -259,90 +369,61 @@
     (.spliterator ^Iterable ops))
 
   Object
-  (equals [this other]
-    (.equiv this other))
-
   (hashCode [this]
-    (.hashCode ops))
+            (.hashCode ops))
 
   (toString [this]
     (.toString ops)))
 
-
 (defn ^ints dense-history-pair-index
-  "Computes an array mapping indexes back and forth for a dense history of ops.
-  For non-client operations, we map pairs of :info messages back and forth."
+  "Given a folder of ops, computes an array mapping indexes back and forth for
+  a dense history of ops. For non-client operations, we map pairs of :info
+  messages back and forth."
+  [folder]
+  (let [^IntMap m (f/fold folder pair-index-fold)
+        ; Translate back to ints
+        ary (int-array (.size m))]
+    (loopr []
+           [^IEntry kv m]
+           (let [i (.key kv)
+                 j (.value kv)]
+             (if j
+               (do (aset-int ary i j)
+                   (aset-int ary j i))
+               (aset-int ary i -1))
+             (recur)))
+    ary))
+
+(defn index-ops
+  "Adds sequential indices to a series of operations. Throws if there are
+  existing indices that wouldn't work with this."
   [ops]
-  (let [pair-index (int-array (count ops))]
-    (loopr [; A map of processes to the index of the op they just
-            ; invoked
-            invokes (transient {})]
-           [op ops]
-           (let [p (:process op)]
-             (case (:type op)
-               :invoke
-               (if-let [invoke (get invokes p)]
-                 (throw (ex-info
-                          (str "Process " p " is still executing "
-                               (pr-str invoke) " and cannot invoke "
-                               (pr-str op))
-                          {:type       ::double-invoke
-                           :op         op
-                           :running-op invoke}))
-                 (recur (assoc! invokes p op)))
-
-               :info
-               (if (client-op? op)
-                 ; For clients, you need to have invoked something
-                 (if-let [invoke (get invokes p)]
-                   (do (aset-int pair-index (:index invoke) (:index op))
-                       (aset-int pair-index (:index op) (:index invoke))
-                       (recur (dissoc! invokes p)))
-                   (throw (ex-info (str "Client " p " logged an :info without invoking anything: " (pr-str op))
-                          {:type    ::info-without-invoke
-                           :op      op})))
-                 ; For non-clients, match successive pairs of infos
-                 (if-let [invoke (get invokes p)]
-                   ; Second
-                   (do (aset-int pair-index (:index invoke) (:index op))
-                       (aset-int pair-index (:index op) (:index invoke))
-                       (recur (dissoc! invokes p)))
-                   ; First
-                   (recur (assoc! invokes p op))))
-
-               (:ok, :fail)
-               (if-let [invoke (get invokes p)]
-                 (do (aset-int pair-index (:index invoke) (:index op))
-                     (aset-int pair-index (:index op) (:index invoke))
-                     (recur (dissoc! invokes p)))
-                 (throw (ex-info (str "Process " p " can not complete "
-                                     (pr-str op) "without invoking it first")
-                                 {:type ::complete-without-invoke
-                                  :op   op})))))
-           ; Any remaining invokes, fill in -1
-           (doseq [op (-> invokes persistent! vals)]
-             (aset-int pair-index (:index op) -1)))
-    pair-index))
-
-(defn check-dense-indices
-  "Checks to make sure that a history is densely indexed, and throws if not.
-  Returns history."
-  [history]
-  (if (and (instance? History history)
-           (dense-indices? history))
+  (if (and (instance? History ops)
+           (dense-indices? ops))
     ; Already checked
-    history
-    ; Gotta double-check
-    (loopr [i 0]
-           [op history]
-           (if (= i (:index op))
-             (recur (inc i))
-             (throw (ex-info (str "History not densely indexed! At index " i
-                                  ", op was" op)
-                    {:type ::not-densely-indexed
-                     :i    i
-                     :op   op})))
-           history)))
+    ops
+    ; Go through em
+    (loopr [ops' (transient [])
+            i    0]
+           [op ops]
+           (if-let [index (:index op)]
+             (if (not= index i)
+               (throw (ex-info {:type ::existing-different-index
+                                :i    i
+                                :op   op}))
+               (recur (conj! ops' op) (inc i)))
+             (recur (conj! ops' (assoc op :index i))
+                    (inc i)))
+           (persistent! ops'))))
+
+(defn dense-history*
+  "Constructs a dense history around a collection of operations. Does not check
+  to make sure the ops are already dense; you have to do that yourself."
+  [ops]
+  (let [folder (f/folder ops)]
+    (DenseHistory. ops
+                   folder
+                   (delay (dense-history-pair-index folder)))))
 
 (defn dense-history
   "A dense history has indexes 0, 1, 2, ..., and can encode its pair index in
@@ -351,8 +432,108 @@
   materialized to a vector."
   [ops]
   (let [; Materialize if necessary.
-        ops (if (vector? ops)
+        ops (if-not (indexed? ops)
               ops
-              (into [] ops))]
-    (check-dense-indices ops)
-    (DenseHistory. ops (delay (dense-history-pair-index ops)))))
+              (into [] ops))
+       ops (index-ops ops)]
+    (dense-history* ops)))
+
+(deftype+ MappedHistory [history map-fn]
+  AbstractVector
+
+  clojure.lang.Counted
+  (count [this]
+    (count history))
+
+  clojure.lang.IReduceInit
+  (reduce [this f init]
+          (reduce ((c/map map-fn) f) init history))
+
+  clojure.lang.Indexed
+  (nth [this i not-found]
+    (map-fn (nth history i not-found)))
+
+  clojure.lang.Reversible
+  (rseq [this]
+    (c/map map-fn (rseq history)))
+
+  clojure.lang.Seqable
+  (seq [this]
+       ; Map always returns a LazySeq (), rather than nil.
+       (let [s (c/map map-fn history)]
+         (when (seq s)
+           s)))
+
+  CollFold
+  (coll-fold [this n combinef reducef]
+    (r/coll-fold history n combinef ((c/map map-fn) reducef)))
+
+  History
+  (dense-indices? [this]
+    (dense-indices? history))
+
+  (get-index [this index]
+    (map-fn (get-index history index)))
+
+  ; Because map-fn preserves indices, we can use our parent's pair index.
+  (pair-index [this index]
+              (.pair-index history index))
+
+  ; Because map-fn preserves indices, we can use our parent's pair index.
+  (completion [this invocation]
+    (assert+ (or (invoke? invocation)
+                 ; Non-clients are allowed to invoke with :info
+                 (and (not (client-op? invocation))
+                      (info? invocation)))
+             IllegalArgumentException
+             (str "Expected an invocation, but got " (pr-str invocation)))
+    (let [i (pair-index this (:index invocation))]
+      (when-not (= -1 i)
+        (.nth this i))))
+
+  (invocation [this completion]
+    (assert+ (not (invoke? completion))
+             IllegalArgumentException
+             (str "Can't ask for the invocation of an invocation: "
+                  (pr-str completion)))
+    (let [i (pair-index this (:index completion))]
+      (when-not (= -1 i)
+        (.nth this i))))
+
+  (fold [this fold]
+        (let [fold    (f/make-fold fold)
+              reducer (:reducer fold)
+              fold    (assoc fold :reducer
+                             (fn fold-map [acc x]
+                               (reducer acc (map-fn x))))]
+          (.fold history fold)))
+
+  (tesser [this tesser-fold]
+          (let [fold' (into (tesser/map map-fn) tesser-fold)]
+            (tesser history fold')))
+
+  Iterable
+  (forEach [this consumer]
+           (.forEach (c/map map-fn history) consumer))
+
+  (iterator [this]
+            (.iterator (c/map map-fn history)))
+
+  (spliterator [this]
+    (.spliterator (c/map map-fn history))))
+
+(defn map
+  "Specialized, lazy form of clojure.core/map which acts on histories
+  themselves. Wraps the given history in a new one which has its operations
+  transformed by (f op). Applies f on every access to an op. This is faster
+  when you intend to traverse the history only a few times, or when you want to
+  keep memory consumption low.
+
+  f is assumed to obey a few laws, but we don't enforce them, in case it turns
+  out to be useful to break these rules later. It should return operations just
+  like its inputs, and with the same :index, so that pairs are preserved. It
+  should also be injective on processes, so that it preserves the concurrency
+  structure of the original. If you violate these rules, get-index, invocation,
+  and completion will likely behave strangely."
+  [f history]
+  (MappedHistory. history f))

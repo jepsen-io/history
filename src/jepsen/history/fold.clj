@@ -51,11 +51,11 @@
     (def dogs (ft/gen-dogs-file! 1e7))
     (def f (f/folder dogs))
 
-  Reducing over ten million dogs as JSON takes about 8.67 seconds on my
+  Reducing over ten million dogs as JSON takes about ten seconds on my
   machine.
 
     (time (into #{} (map :legs) dogs))
-    ; 8678 msecs
+    ; 10364 msecs
 
   But with a folder, we can do something *neat*:
 
@@ -63,7 +63,7 @@
                   :reducer            (fn [legs dog] (conj legs (:legs dog)))
                   :combiner           clojure.set/union})
     (time (f/fold f leg-set))
-    ; 1534 msecs
+    ; 1660 msecs
 
   This went roughly six times faster because the folder reduced each chunk in
   parallel. Now let's run, say, ten reductions in parallel.
@@ -77,9 +77,30 @@
   reductions has to re-parse the file as it goes.
 
     (time (doall (pmap (fn [_] (f/fold f leg-set)) (range 10))))
-    ; 3628 msecs
+    ; 2261 msecs
 
-  Eight times faster than the parallel version!
+  Twelve times faster than the parallel version! And roughly 45x faster than
+  doing the reductions naively in serial. How? Because when you ask a folder to
+  reduce something, and it's already running another reduction, it *joins* your
+  new reduction to the old one and performs most (or even all) of the work in
+  a single pass. The folder is smart enough to do this for both linear and
+  concurrent folds--and it does it while ensuring strict order and thread
+  safety for mutable accumulators. Let's replace that reduction with a mutable
+  HashSet, and convert it back to a Clojure set at the end.
+
+    (import java.util.HashSet)
+    (defn mut-hash-set [] (HashSet.))
+    (def fast-leg-set {:reducer-identity mut-hash-set
+                       :reducer          (fn [^HashSet s, dog]
+                                           (.add s (:legs dog)) s)
+                       :combiner-identity mut-hash-set
+                       :combiner         (fn [^HashSet s1, ^HashSet s2]
+                                           (.addAll s1 s2) s1)
+                       :post-combiner    set})
+    (time (doall (pmap (fn [_] (f/fold f fast-leg-set)) (range 10))))
+    ; 2197 msecs
+
+  # In general
 
   A fold represents a reduction over a history, which can optionally be
   executed over chunks concurrently. It's a map with the following fields:
@@ -123,10 +144,11 @@
                        left-to-right. Right now this does nothing; we haven't
                        implemented associative combine.
 
-    :asap?             If true, prioritizes execution of this fold as quickly
-                       as possible. This makes other folds less efficient to
-                       join, and can slow down the system overall when you do
-                       multiple folds in parallel.
+    :asap?             Folders ramp up processing of concurrent folds gradually
+                       to give other folds a chance to join the pass. Setting
+                       this to `true` disables that optimization, which means a
+                       fold can complete more quickly--at the cost of slowing
+                       down other folds.
 
   Folds should be pure functions of their histories, though reducers and
   combiners are allowed to use in-memory mutability; each is guaranteed to be
@@ -149,98 +171,7 @@
 
   Like transducers, post-reducers and post-combiners act on the values inside
   Reduced wrappers; they cannot distinguish between reduced and non-reduced
-  values.
-
-  ## Scheduling
-
-  There are several challenges for Jepsen checkers.
-
-  1. We have no idea how many other checkers are executing, or what kind of
-     data they intend to compute. This causes duplicated work and many passes
-     over the underlying history.
-
-  2. We're running on fixed hardware with a finite pool of CPUs, and want to
-     spawn a reasonable number of tasks, take advantage of at least *some*
-     memory and cache locality, etc.
-
-  3. Checkers want to be able to ask for the results of a fold at any time, and
-     block until it's ready.
-
-  4. But a regular function call like `reduce` won't work: a caller might do
-     (reduce a history) (reduce b history) and we wouldn't know that a and b
-     could have been executed in one pass.
-
-  5. Sometimes we want delay-like behavior. Histories can declare, for
-     instance, that they have a pair index or a count available, but those
-     computations shouldn't be performed until someone asks for them.
-
-  6. Sometimes we want future-like behavior: we know we'll use the results of a
-     computation, and starting it now is more efficient than waiting for
-     someone to ask for it.
-
-  All of this suggests to me that the normal approaches to concurrent execution
-  (e.g. just spawning a bunch of futures or delays) are not going to work: we
-  need a new, richer kind of control flow here. The need to coordinate between
-  callers who are not aware of each other also tells us that whatever executes
-  folds should be a shared, mutable thing rather than a pure, immutable
-  structure. For example, we might want:
-
-                  +-------------------------+   +-----------------------+
-                  |    Original History     |---|   Dataflow Executor   |
-                  +-------------------------+   +-----------------------+
-                            ^     ^
-                  +---------|     |---------+
-                  |                         |
-    +-------------------------+    +--------------------------+
-    | History w/just clients  |    |  History w/just writes   |
-    +-------------------------+    +--------------------------+
-        ^                               ^
-        +--Build a pair index           +--Build a pair index
-        |                               |
-        +--With that, find G1a          +--With that, compute latencies
-        |
-        +--Count ok ops
-
-  Two different checkers construct different histories derived from the main
-  history--the left checker makes a view just with client ops, and the right
-  checker makes a view with just writes. Both are implemented as lazy views
-  over the original history.
-
-  Then the clients start performing queries. They submit these queries to their
-  individual histories, which in turn pass them up (with some translation) to
-  the original history, which hands them to the dataflow executor. Let's say:
-
-  1. The left checker asks for G1a first. The dataflow executor realizes it
-     needs to compute a pair index first, so it begins that pass over the raw
-     history.
-
-  2. The left checker asks for a count of OK ops. The executor completes its
-     pair-index pass of the first chunk, checks its state, and realizes that
-     since neither has a dependency on the other, these operations can be
-     unified into a single pass. It counts the first chunk, then merges the
-     pair-index and count folds into a single fold and begins the remaining
-     chunks.
-
-  3. The right checker asks for latencies. Since this depends on the pair
-     index, which is currently under computation, the executor defers the fold
-     for later.
-
-  4. The executor completes its first pass and delivers the results of the pair
-     index and count. It discovers that the G1a and latencies can also be
-     computed in a single pass, constructs a merged fold, and begins executing
-     them. Once they complete, their results are delivered to the two checkers.
-
-  This pre-emption and merging of fold passes is important: without it, we
-  would need callers to block and coordinate when they actually asked for
-  results.
-
-  ## Handles
-
-  Users need a way to receive the results of folds, start them off, cancel
-  them, and so on. To do this we introduce a new datatype: a Handle. Submitting
-  a fold to the executor returns a Handle. Handles support the usual IDeref to
-  block on results and receive exceptions. They also support additional
-  control-flow functions for launching and cancelling folds."
+  values."
   (:refer-clojure :exclude [reduce])
   (:require [clojure [core :as c]
                      [pprint :as pprint :refer [pprint]]]

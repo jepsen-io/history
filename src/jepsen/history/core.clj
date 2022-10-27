@@ -7,7 +7,8 @@
                                ]]
             [tesser.utils :refer [chunk-vec
                                   chunk-array
-                                  reducible-chunk]]))
+                                  reducible-chunk]])
+  (:import (clojure.lang IHashEq)))
 
 ;; Custom collections
 
@@ -28,6 +29,10 @@
 
   (assoc [this k v]
          (.assocN this k v))
+
+  IHashEq
+  (hasheq [this]
+          (.hasheq (vec this)))
 
   clojure.lang.Indexed
   (nth [this i]
@@ -66,6 +71,12 @@
   Object
   (equals [this other]
           (.equiv this other))
+
+  (hashCode [this]
+            (.hashCode (vec this)))
+
+  (toString [this]
+    (.toString (vec this)))
 
   potemkin.collections/PotemkinFn
   (invoke [this k]
