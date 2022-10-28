@@ -1,4 +1,4 @@
-(defproject jepsen.history "0.1.0-SNAPSHOT"
+(defproject io.jepsen/history "0.1.0-SNAPSHOT"
   :description "A library for working with Jepsen's histories of concurrent systems."
   :url "https://github.com/jepsen-io/history"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
@@ -26,7 +26,7 @@
   ; We deliberatly want a reasonable heap here, because our tests are going to
   ; blow it up.
   :jvm-opts ["-Xmx8g" "-server"
-             "-XX:-OmitStackTraceInFastThrow"
+             ; "-XX:-OmitStackTraceInFastThrow"
 ;             "-agentpath:/home/aphyr/yourkit/bin/linux-x86-64/libyjpagent.so=disablestacktelemetry,exceptions=disable,delay=10000,usedmem=50"
              ]
   :test-selectors {:default (fn [m] (not (or (:slow m) (:perf m))))
