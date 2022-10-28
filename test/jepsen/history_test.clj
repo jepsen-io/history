@@ -313,7 +313,7 @@
 
   (when (instance? History a)
     (testing "pair-index"
-      (doseq [i (range (count a))]
+      (doseq [i (map :index a)]
         (is (= (h/pair-index a i) (h/pair-index b i)))))
 
     (testing "get-index"
@@ -364,25 +364,16 @@
              seq
              not))))
 
-(defn check-history
-  "Checks that something works like the given vector of operations."
+(defn check-pairs
+  "Checks pair-index related functionality"
   [ops h]
-  ; Should be equivalent to underlying ops vector
-  (check-history-equiv ops h)
-
-  ; But also support get-index
-  (testing "get-index"
-    (doseq [op ops]
-      (is (identical? op (h/get-index h (:index op))))))
-
-  ; And pair operations
   (testing "pairs"
     (doseq [op ops]
       (testing "symmetric"
         (when (or (h/invoke? op)
                   (not (h/client-op? op)))
           (when-let [completion (h/completion h op)]
-            (is (identical? op (h/invocation h completion))))))
+            (is (= op (h/invocation h completion))))))
       (if (h/client-op? op)
         ; For clients, we should have an obvious invoke/complete
         ; pair
@@ -403,7 +394,19 @@
             (let [other (h/completion h op)]
               (when other
                 (let [[a b] (sort-by :index [op other])]
-                  (check-invoke-complete h a b))))))))
+                  (check-invoke-complete h a b)))))))))
+
+
+(defn check-history
+  "Checks that something works like the given vector of operations."
+  [ops h]
+  ; Should be equivalent to underlying ops vector
+  (check-history-equiv ops h)
+
+  ; But also support get-index
+  (testing "get-index"
+    (doseq [op ops]
+      (is (= op (h/get-index h (:index op))))))
 
   ; And folds
   (testing "tesser"
@@ -422,6 +425,7 @@
             [ops Ops-gen]
             (let [h (h/dense-history ops)]
               (check-history ops h)
+              (check-pairs ops h)
 
               (testing "indices"
                 (is (h/dense-indices? h))
@@ -431,24 +435,65 @@
 (deftest ^:focus sparse-history-test
   (checking "clients" n
             [ops sparse-Ops-gen]
-            (let [ops ops
-                  h   (h/sparse-history ops)]
+            (let [h (h/sparse-history ops)]
               (check-history ops h)
-
+              (check-pairs ops h)
               (testing "indices"
-                (is (not (h/dense-indices? h)))))))
-
+                (is (not (h/dense-indices? h))))))
+  (checking "dense history"
+            [ops Ops-gen]
+            (let [h0 (h/dense-history ops)
+                  h1 (h/sparse-history ops)]
+              (check-history h0 h1))))
 
 (deftest ^:focus map-test
   (checking "rewrite" n
-            [h dense-history-gen]
-            (check-history-equiv (h/dense-history (mapv rewrite-op h))
-                                 (h/map rewrite-op h))))
+            [ops Ops-gen]
+            (let [h (h/map rewrite-op (h/dense-history ops))]
+              (is (h/dense-indices? h))
+              (check-history (mapv rewrite-op ops) h)
+              (testing "equivalence to dense history"
+                (let [h0 (h/dense-history (map rewrite-op ops))]
+                  (check-history-equiv h0 h))))))
 
-#_(deftest filter-test
-  (checking "clients" n
-            [ops ops-gen]
-            (let [h (h/filter h/client-op (dense-history ops))]
-              (testing "not dense"
-                (is (not (h/dense-indices? h))))
-              (check-history (vec (filter h/client-op? ops)) h))))
+(deftest ^:focus filter-test
+  (checking "dense -> clients" n
+            [ops Ops-gen]
+            (let [h (h/filter h/client-op? (h/dense-history ops))]
+              (is (not (h/dense-indices? h)))
+              (check-history (vec (filter h/client-op? ops)) h)
+              (testing "equivalence to sparse history"
+                (let [h0 (h/sparse-history (filter h/client-op? ops))]
+                  (check-history-equiv h0 h))))))
+
+(defn transform-history
+  "Takes a model and a history and applies a named transformation to both."
+  [[model history] transform]
+  (case transform
+    :dense-history  [model (h/dense-history history)]
+    :sparse-history [model (h/sparse-history history)]
+    :rewrite-op     [(mapv rewrite-op model)
+                     (h/map rewrite-op history)]
+    :clients        [(vec (filter h/client-op? model))
+                     (h/client-ops history)]
+    :oks            [(vec (filter h/ok? model))
+                     (h/oks history)]
+    :reads          [(vec (filter read? model))
+                     (h/filter (comp #{:r} :f) history)]))
+
+(deftest ^:focus transform-history-test
+  ; Generates a series of basic ops, then a series of transformations on top of
+  ; it. Applies transforms to both a model and a history, and verifies that the
+  ; product checks out.
+  (checking "transformed" n
+            [ops Ops-gen
+             init-transform (gen/elements [:dense-history :sparse-history])
+             transforms (gen/vector
+                          (gen/elements [:sparse-history
+                                         :rewrite-op
+                                         :clients
+                                         :oks
+                                         :reads]))]
+            (let [[model history] (reduce transform-history [ops ops]
+                                          (cons init-transform transforms))]
+              (check-history model history))))

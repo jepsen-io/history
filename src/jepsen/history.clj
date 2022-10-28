@@ -385,9 +385,9 @@
            [op ops]
            (if-let [index (:index op)]
              (if (not= index i)
-               (throw (ex-info {:type ::existing-different-index
-                                :i    i
-                                :op   op}))
+               (throw+ {:type ::existing-different-index
+                        :i    i
+                        :op   op})
                (recur (conj! ops' op) (inc i)))
              (recur (conj! ops' (assoc op :index i))
                     (inc i)))
@@ -742,3 +742,177 @@
   and completion will likely behave strangely."
   [f history]
   (MappedHistory. history f))
+
+;; Filtered histories
+
+(deftype+ FilteredHistory [history ; Underlying history
+                           pred    ; Filtering predicate
+                           count-  ; Delayed count
+                           indices ; Delayed int array of all op indices
+                           ]
+  AbstractVector
+  AbstractHistory
+
+  CollFold
+  (coll-fold [this n combinef reducef]
+             (r/coll-fold history n combinef ((c/filter pred) reducef)))
+
+  ; We're not counted, so we'll do IPersistentCollection instead
+  clojure.lang.IPersistentCollection
+  (count [this] @count-)
+
+  IReduceInit
+  (reduce [this f init]
+          (.reduce history ((c/filter pred) f) init))
+
+  Reversible
+  (rseq [this]
+        (c/filter pred (rseq history)))
+
+  Seqable
+  (seq [this]
+       ; Might be empty!
+       (let [s (c/filter pred (seq history))]
+         (when (seq s)
+           s)))
+
+  History
+  (dense-indices? [this] false)
+
+  (get-index [this index]
+             (when-let [op (get-index history index)]
+               (when (pred op)
+                 op)))
+
+  (pair-index [this index]
+              ; We need to constrain the pair index to not return values for
+              ; elements not in the set, so we have to actually fetch the
+              ; element and check it here.
+              (let [i (pair-index history index)]
+                (if (= -1 i)
+                  -1
+                  (let [op (.get-index this index)]
+                    (if (pred op) i -1)))))
+
+  ; To avoid double-fetching during our safety check in pair-index, we provide
+  ; custom logic here too rather than relying on AHistory.
+  (completion [this invocation]
+              (assert-invoke+ invocation)
+              (let [i (.pair-index this (:index invocation))]
+                (when-not (= -1 i)
+                  (let [op (.get-index this i)]
+                    (when (pred op) op)))))
+
+  (invocation [this completion]
+              (assert-complete completion)
+              (let [i (.pair-index this (:index completion))]
+                (when-not (= -1 i)
+                  (let [op (.get-index this i)]
+                    (when (pred op) op)))))
+
+  (fold [this fold]
+        (let [fold    (f/make-fold fold)
+              reducer (:reducer fold)
+              fold (assoc fold :reducer
+                          (fn fold-filter [acc x]
+                            (if (pred x)
+                              (reducer acc x)
+                              acc)))]
+          (.fold history fold)))
+
+  (tesser [this tesser-fold]
+          (let [fold (into (tesser/filter pred) tesser-fold)]
+            (tesser history fold)))
+
+  clojure.lang.Indexed
+  (nth [this i not-found]
+       (let [^ints a @indices]
+         (when-not (< -1 i (alength a))
+           (throw (IndexOutOfBoundsException. (str "Index " i " out of bounds"))))
+         (.get-index this (aget a i))))
+
+  Iterable
+  (forEach [this consumer]
+            (.forEach (c/filter pred history) consumer))
+
+  (iterator [this]
+            (.iterator (c/filter pred history)))
+
+  (spliterator [this]
+               (.spliterator (c/filter pred history))))
+
+(def filtered-history-indices-fold
+  "A fold which computes an int array of all the indexes in a filtered
+  history."
+  (let [; Build up lists
+        reducer (fn reducer
+                  ([] (.linear (List.)))
+                  ([l] l)
+                  ([^IList indices, op]
+                   (.addLast indices (:index op))))
+        ; Concat together, then convert to array
+        combiner (fn combiner
+                   ([] (.linear (List.)))
+                   ([^IList indices]
+                    (let [ary (int-array (.size indices))]
+                      (loopr [i 0]
+                             [index indices]
+                             (do (aset ary i index)
+                                 (recur (unchecked-inc-int i))))
+                      ary))
+                   ([^IList indices, ^IList chunk-indices]
+                    (.concat indices chunk-indices)))]
+        {:name     :filtered-history-indices
+         :reducer  reducer
+         :combiner combiner}))
+
+(defn filter
+  "Specialized, lazy form of clojure.core/filter which acts on histories and
+  returns histories. Wraps the given history in a new one which only has
+  operations passing (pred op)."
+  [f history]
+  (let [count- (delay (->> (tesser/filter f)
+                           (tesser/count)
+                           (tesser history)))
+        indices (delay (fold history
+                             (update filtered-history-indices-fold
+                                     :reducer
+                                     (c/filter f))))]
+    (FilteredHistory. history f count- indices)))
+
+(defn remove
+  "Inverse of filter"
+  [f history]
+  (filter (complement f) history))
+
+(defn client-ops
+  "Filters a history to just clients."
+  [history]
+  (filter client-op? history))
+
+(defn invokes
+  "Filters a history to just invocations."
+  [history]
+  (filter invoke? history))
+
+(defn oks
+  "Filters a history to just :ok ops"
+  [history]
+  (filter ok? history))
+
+(defn infos
+  "Filters a history to just :info ops."
+  [history]
+  (filter info? history))
+
+(defn fails
+  "Filters a history to just :fail ops"
+  [history]
+  (filter fail? history))
+
+(defn possible
+  "Filters a history to just :ok or :info ops"
+  [history]
+  (filter (fn possible? [op]
+            (or (ok? op) (fail? op)))
+          history))
