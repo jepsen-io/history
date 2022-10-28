@@ -101,7 +101,8 @@
             [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ loopr]]
             [jepsen.history [core :refer [AbstractVector]]
-                            [fold :as f]]
+                            [fold :as f]
+                            [task :as task]]
             [potemkin :refer [def-abstract-type
                               definterface+
                               deftype+]]
@@ -138,7 +139,7 @@
 (alter-meta! #'pprint/*current-length* #(dissoc % :private))
 (defn pprint-kv
   "Helper for pretty-printing op fields."
-  [out k v]
+  [^Writer out k v]
   (pprint/write-out k)
   (.write out " ")
   ;(pprint-newline :linear)
@@ -151,7 +152,7 @@
 ; record formatting.
 ; Why is this not public if you need it to print properly?
 (defmethod pprint/simple-dispatch jepsen.history.Op
-  [op]
+  [^Op op]
   (let [^Writer out *out*]
   ; See https://github.com/clojure/clojure/blob/5ffe3833508495ca7c635d47ad7a1c8b820eab76/src/clj/clojure/pprint/dispatch.clj#L105
     (pprint-logical-block :prefix "{" :suffix "}"
@@ -253,7 +254,8 @@
                         (.linear (Map.))    ; tail
                         (.linear (List.))]) ; non-client
    :reducer
-   (fn reducer [[pairs head tail non-client] op]
+   (fn reducer [[^IntMap pairs, ^IMap head, ^IMap tail, ^IList non-client],
+                ^Op op]
      (if-not (client-op? op)
        [pairs head tail (.addLast non-client op)]
        ; Client op
@@ -285,13 +287,13 @@
                          (.linear (Map.))])  ; running
    :combiner
    (fn combiner [[^IntMap pairs, ^IMap running]
-                 [chunk-pairs head tail non-client]]
+                 [^IntMap chunk-pairs, ^IMap head, ^IMap tail, non-client]]
      (let [; Merge pairs
            pairs (.merge pairs chunk-pairs Maps/MERGE_LAST_WRITE_WINS)
            ; Complete running operations using head
            [pairs running]
-           (loopr [pairs'   pairs
-                   running' running]
+           (loopr [^IntMap pairs'   pairs
+                   ^IMap   running' running]
                   [op (.values head)]
                   (let [p      (:process op)
                         invoke (.get running p nil)
@@ -301,34 +303,34 @@
                     (recur (.. pairs' (put i0 i1) (put i1 i0))
                            (.remove running' p))))
            ; Handle non-client ops
-           [pairs running]
-           (loopr [pairs'   pairs
-                   running' running]
+           [pairs ^IMap running]
+           (loopr [^IntMap pairs'   pairs
+                   ^IMap   running' running]
                   [op non-client]
                   (let [p (:process op)]
-                    (if-let [invoke (.get running p nil)]
+                    (if-let [invoke (.get running' p nil)]
                       ; Complete
                       (let [i0 (:index invoke)
                             i1 (:index op)]
                         (recur (.. pairs' (put i0 i1) (put i1 i0))
-                               (.remove running p)))
+                               (.remove running' p)))
                       ; Begin
-                      (recur pairs' (.put running p op)))))
+                      (recur pairs' (.put running' p op)))))
 
            ; Begin running operations using tail
            running (.merge running tail Maps/MERGE_LAST_WRITE_WINS)]
        [pairs running]))
    :post-combiner
-   (fn post-combiner [[pairs running]]
+   (fn post-combiner [[pairs ^IMap running]]
      ; Finish off running ops with nil
-     (loopr [pairs' pairs]
-            [op (.values running)]
-            (recur (.put pairs' (:index op) -1))
+     (loopr [^IntMap pairs' pairs]
+            [^Op op (.values running)]
+            (recur (.put pairs' (.index op) (Integer. -1)))
             (.forked pairs')))})
 
 ;; Histories
 
-(definterface+ History
+(definterface+ IHistory
   (dense-indices? [history]
                   "Returns true if indexes in this history are 0, 1, 2, ...")
 
@@ -357,8 +359,32 @@
           "Executes a Tesser fold on this history. See history.fold/tesser for
           details."))
 
+(definterface+ Taskable
+  (executor [this]
+            "Returns the history's task executor. See jepsen.history.task for
+            details. All histories descending from the same history
+            (e.g. via map or filter) share the same task executor.")
+
+  (task! [this name f]
+         [this name deps f]
+         [this name data deps f]
+         "Launches a Task on this history's task executor. Use this to perform
+         parallel, compute-bound processing of a history in a dependency
+         tree--for instance, to perform multiple folds over a history at the
+         same time. See jepsen.history.task/submit! for details.")
+
+  (catch-task! [this name dep f]
+               [this name data dep f]
+               "Adds a catch task to this history which handles errors on the
+               given dep. See jepsen.history.task/catch!.")
+
+  (cancel-task! [this task]
+                "Cancels a task on the this history's task executor. Returns
+                task."))
+
+
 (def-abstract-type AbstractHistory
-  History
+  IHistory
   (completion [this invocation]
               (assert-invoke+ invocation)
               (let [i (.pair-index this (:index invocation))]
@@ -369,13 +395,34 @@
               (assert-complete completion)
               (let [i (.pair-index this (:index completion))]
                 (when-not (= -1 i)
-                  (.get-index this i)))))
+                  (.get-index this i))))
+
+  Taskable
+  (executor [this] executor)
+
+  (task! [this name f]
+         (task/submit! executor name f))
+
+  (task! [this name deps f]
+         (task/submit! executor name deps f))
+
+  (task! [this name data deps f]
+         (task/submit! executor name data deps f))
+
+  (catch-task! [this name dep f]
+               (task/catch! executor name dep f))
+
+  (catch-task! [this name data dep f]
+               (task/catch! executor name data dep f))
+
+  (cancel-task! [this task]
+                (task/cancel! executor task)))
 
 (defn add-dense-indices
   "Adds sequential indices to a series of operations. Throws if there are
   existing indices that wouldn't work with this."
   [ops]
-  (if (and (instance? History ops)
+  (if (and (instance? IHistory ops)
            (dense-indices? ops))
     ; Already checked
     ops
@@ -396,7 +443,7 @@
 (defn assert-indices
   "Ensures every op has an :index field. Throws otherwise."
   [ops]
-  (if (instance? History ops)
+  (if (instance? IHistory ops)
     ops
     (loopr []
            [op ops]
@@ -445,6 +492,8 @@
    ops
    ; A folder over ops
    folder
+   ; Our executor
+   executor
    ; A delayed int array mapping invocations to completions, or -1 where no
    ; link exists.
    pair-index]
@@ -476,7 +525,7 @@
   (coll-fold [this n combinef reducef]
     (r/coll-fold ops n combinef reducef))
 
-  History
+  IHistory
   (dense-indices? [this]
     true)
 
@@ -549,6 +598,7 @@
          folder (f/folder ops)]
      (DenseHistory. ops
                     folder
+                    (task/executor)
                     (delay (dense-history-pair-index folder))))))
 
 ;; Sparse histories
@@ -557,6 +607,7 @@
   [ops         ; A sparse vector-like of operations; e.g. one where indexes
                ; aren't 0, 1, ...
    folder      ; A folder over those ops
+   executor    ; Our task executor
    by-index    ; A delay of an IntMap which takes an op index to an offset in
                ; ops.
    pair-index] ; A delay of a pair index, as an IntMap.
@@ -570,7 +621,7 @@
 
   clojure.lang.IReduceInit
   (reduce [this f init]
-          (.reduce folder f init))
+          (.reduce ^IReduceInit folder f init))
 
   clojure.lang.Indexed
   (nth [this i not-found]
@@ -586,18 +637,18 @@
 
   CollFold
   (coll-fold [this n combinef reducef]
-             (r/coll-fold folder n combinef reducef))
+             (.coll-fold ^CollFold folder n combinef reducef))
 
-  History
+  IHistory
   (dense-indices? [this] false)
 
   (get-index [this index]
-             (let [i (.get ^IntMap @by-index index -1)]
+             (let [i (.get ^IntMap @by-index index (Integer. -1))]
                (when-not (= i -1)
-                 (nth ops (.get ^IntMap @by-index index -1)))))
+                 (nth ops i))))
 
   (pair-index [this index]
-              (.get ^IntMap @pair-index index -1))
+              (.get ^IntMap @pair-index index (Integer. -1)))
 
   (fold [this fold]
         (f/fold folder fold))
@@ -639,9 +690,9 @@
           ([[i, ^IntMap m]] (.forked m))
           ([[^long i, ^IntMap m] chunk-indices]
            (loopr [j  0
-                   m' m]
+                   ^IntMap m' m]
                   [index chunk-indices]
-                  (recur (inc j) (.put m' index (+ i j)))
+                  (recur (inc j) (.put m' (long index) ^Object (+ i j)))
                   [(+ i j) m])))]
     {:name     :sparse-history-by-index
      :reducer  reducer
@@ -659,11 +710,41 @@
          folder     (f/folder ops)
          by-index   (delay (f/fold folder sparse-history-by-index-fold))
          pair-index (delay (f/fold folder pair-index-fold))]
-     (SparseHistory. ops folder by-index pair-index))))
+     (SparseHistory. ops folder (task/executor) by-index pair-index))))
+
+(defn history
+  "Just make a history out of something. Figure it out. Options are:
+
+    :have-indices?  If true, these ops already have :index fields.
+    :already-ops?   If true, these ops are already Op records.
+    :dense-indices? If true, indices are already dense.
+
+  With :dense-indices?, we'll assume indices are dense and construct a dense
+  history. With have-indices? we'll use existing indices and construct a sparse
+  history. Without either, we examine the first op and guess: if it has no
+  :index, we'll assign sequential ones and construct a dense history. If the
+  first op does have an :index, we'll use the existing indices and construct a
+  sparse history."
+  ([ops]
+   (history ops {}))
+  ([ops {:keys [dense-indices? have-indices?] :as options}]
+   (cond dense-indices?
+         (dense-history ops options)
+
+         have-indices?
+         (sparse-history ops options)
+
+         ; Guess about indices
+         (integer? (:index (first ops)))
+         (sparse-history ops options)
+
+         ; No indices; we'll give them dense ones.
+         true
+         (dense-history ops options))))
 
 ;; Mapped histories
 
-(deftype+ MappedHistory [history map-fn]
+(deftype+ MappedHistory [^IHistory history map-fn executor]
   AbstractVector
   AbstractHistory
 
@@ -694,7 +775,7 @@
   (coll-fold [this n combinef reducef]
     (r/coll-fold history n combinef ((c/map map-fn) reducef)))
 
-  History
+  IHistory
   (dense-indices? [this]
     (dense-indices? history))
 
@@ -719,13 +800,13 @@
 
   Iterable
   (forEach [this consumer]
-           (.forEach (c/map map-fn history) consumer))
+           (.forEach ^Iterable (c/map map-fn history) consumer))
 
   (iterator [this]
-            (.iterator (c/map map-fn history)))
+            (.iterator ^Iterable (c/map map-fn history)))
 
   (spliterator [this]
-    (.spliterator (c/map map-fn history))))
+    (.spliterator ^Iterable (c/map map-fn history))))
 
 (defn map
   "Specialized, lazy form of clojure.core/map which acts on histories
@@ -739,14 +820,17 @@
   like its inputs, and with the same :index, so that pairs are preserved. It
   should also be injective on processes, so that it preserves the concurrency
   structure of the original. If you violate these rules, get-index, invocation,
-  and completion will likely behave strangely."
+  and completion will likely behave strangely.
+
+  A mapped history inherits the same task executor as the original history."
   [f history]
-  (MappedHistory. history f))
+  (MappedHistory. history f (executor history)))
 
 ;; Filtered histories
 
-(deftype+ FilteredHistory [history ; Underlying history
+(deftype+ FilteredHistory [^IHistory history ; Underlying history
                            pred    ; Filtering predicate
+                           executor ; Task executor
                            count-  ; Delayed count
                            indices ; Delayed int array of all op indices
                            ]
@@ -763,7 +847,7 @@
 
   IReduceInit
   (reduce [this f init]
-          (.reduce history ((c/filter pred) f) init))
+          (.reduce ^IReduceInit history ((c/filter pred) f) init))
 
   Reversible
   (rseq [this]
@@ -776,7 +860,7 @@
          (when (seq s)
            s)))
 
-  History
+  IHistory
   (dense-indices? [this] false)
 
   (get-index [this index]
@@ -833,13 +917,13 @@
 
   Iterable
   (forEach [this consumer]
-            (.forEach (c/filter pred history) consumer))
+            (.forEach ^Iterable (c/filter pred history) consumer))
 
   (iterator [this]
-            (.iterator (c/filter pred history)))
+            (.iterator ^Iterable (c/filter pred history)))
 
   (spliterator [this]
-               (.spliterator (c/filter pred history))))
+               (.spliterator ^Iterable (c/filter pred history))))
 
 (def filtered-history-indices-fold
   "A fold which computes an int array of all the indexes in a filtered
@@ -856,7 +940,7 @@
                    ([^IList indices]
                     (let [ary (int-array (.size indices))]
                       (loopr [i 0]
-                             [index indices]
+                             [^Integer index indices]
                              (do (aset ary i index)
                                  (recur (unchecked-inc-int i))))
                       ary))
@@ -869,7 +953,9 @@
 (defn filter
   "Specialized, lazy form of clojure.core/filter which acts on histories and
   returns histories. Wraps the given history in a new one which only has
-  operations passing (pred op)."
+  operations passing (pred op).
+
+  A filtered history inherits the task executor of the original."
   [f history]
   (let [count- (delay (->> (tesser/filter f)
                            (tesser/count)
@@ -878,7 +964,7 @@
                              (update filtered-history-indices-fold
                                      :reducer
                                      (c/filter f))))]
-    (FilteredHistory. history f count- indices)))
+    (FilteredHistory. history f (task/executor) count- indices)))
 
 (defn remove
   "Inverse of filter"

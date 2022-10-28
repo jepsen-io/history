@@ -247,9 +247,9 @@
              (aset-int pair-index (:index op) -1)))
     pair-index))
 
-(deftest ^:focus pair-index-spec
+(deftest ^:focus pair-index-test
   (checking "pair index" n
-            [ops        ops-gen
+            [ops        Ops-gen
              chunk-size (gen/choose 1 (max 1 (count ops)))]
             (is (= (vec (model-dense-pair-index ops))
                    (vec (h/dense-history-pair-index
@@ -413,7 +413,29 @@
     (is (= (frequencies (map :f ops))
            (->> (t/map :f)
                 (t/frequencies)
-                (h/tesser h))))))
+                (h/tesser h)))))
+
+  (testing "tasks"
+    (testing "basics"
+      (let [a (h/task! h :a (fn [_] :a))
+            b (h/task! h :b [a] (fn [[a]] [:b a]))]
+        (is (= [:b :a] @b))
+        (is (= :a @a))))
+
+    (testing "catch"
+      (let [a (h/task! h :crash (fn [_] (/ 1 0)))
+            b (h/catch-task! h :catch a (fn [err] :caught))]
+        (is (= :caught @b))
+        (is (thrown? ArithmeticException @a))))
+
+    (testing "cancel"
+      (let [p (promise)
+            a (h/task! h :a (fn [_] @p :a))
+            b (h/task! h :b [a] (fn [[a]] [a :b]))
+            b (h/task! h :c [b] (fn [[b]] [b :c]))]
+        (h/cancel-task! h a)
+        (p true)
+        (is (not (realized? b)))))))
 
 (def dense-history-gen
   "Generator of dense histories."
@@ -488,12 +510,14 @@
   (checking "transformed" n
             [ops Ops-gen
              init-transform (gen/elements [:dense-history :sparse-history])
+             transform-count (gen/choose 1 5)
              transforms (gen/vector
                           (gen/elements [:sparse-history
                                          :rewrite-op
                                          :clients
                                          :oks
-                                         :reads]))]
+                                         :reads])
+                          transform-count)]
             (let [[model history] (reduce transform-history [ops ops]
                                           (cons init-transform transforms))]
               (check-history model history))))

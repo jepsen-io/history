@@ -32,7 +32,7 @@
 
   IHashEq
   (hasheq [this]
-          (.hasheq (vec this)))
+          (.hasheq ^IHashEq (vec this)))
 
   clojure.lang.Indexed
   (nth [this i]
@@ -73,10 +73,10 @@
           (.equiv this other))
 
   (hashCode [this]
-            (.hashCode (vec this)))
+            (.hashCode ^Object (vec this)))
 
   (toString [this]
-    (.toString (vec this)))
+    (.toString ^Object (vec this)))
 
   potemkin.collections/PotemkinFn
   (invoke [this k]

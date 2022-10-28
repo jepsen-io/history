@@ -232,8 +232,8 @@
 
   (equals [this other]
     (or (identical? this other)
-      (and (instance? Task other)
-           (= id (.id ^Task other))))))
+      (and (instance? ITask other)
+           (= id (.id ^ITask other))))))
 
 ; Represents low-level tasks. For speed, we hash and compare equality strictly
 ; by ID. Tasks should not be compared across different executors!
@@ -285,6 +285,7 @@
          ; here. Java people love to do Weird Things in the exception
          ; hierarchy. Check real-pmap from dom-top?
          (catch Throwable t
+           ; (info t (pr-str this) "threw!")
            (deliver output t))
          (finally
            ; Inform executor we're done
@@ -343,26 +344,28 @@
   (toString [this]
             (str "(Catch " id " " (pr-str name)
                  (when data (str " " (pr-str data)))
-                 "[" dep-id "])")))
+                 " [" dep-id "])")))
 
 (defn pseudotask
   "One of the weird tricks we use (programmers HATE him!) is to abuse the
   id-only equality semantics of Task objects for efficient lookups in our
-  internal graphs and sets. This constructs an empty task with the given ID."
+  internal graphs and sets. This constructs an empty task with the given ID.
+  Note also that Tasks and Catches compare equal!"
   [^long id]
   (Task. id nil nil nil nil nil nil nil))
 
 ; pprint will try to block on the deref of tasks forever; makes it impossible
 ; to debug stuff
-(defmethod pprint/simple-dispatch jepsen.history.task.Task
+(defmethod pprint/simple-dispatch jepsen.history.task.ITask
   [task]
   (.write ^java.io.Writer *out* (str task)))
 (prefer-method pprint/simple-dispatch
-               jepsen.history.task.Task clojure.lang.IDeref)
+               jepsen.history.task.ITask clojure.lang.IDeref)
 
 ; Ditto prn
-(defmethod print-method jepsen.history.task.Task [t ^java.io.Writer w]
+(defmethod print-method jepsen.history.task.ITask [t ^java.io.Writer w]
   (.write w (str t)))
+(prefer-method print-method jepsen.history.task.ITask clojure.lang.IDeref)
 
 ; An immutable representation of our executor state. By happy circumstance, it
 ; is *also* an immutable representation of a queue, which the executor can pull
@@ -403,7 +406,7 @@
           (.forked (Set.))
           (.forked (List.))))
 
-(defn ^Task get-task
+(defn ^ITask get-task
   "Fetches a Task from a state by ID. Returns nil if task is not known."
   [^State state, ^long task-id]
   ;(info :get-task (.dep-graph state) task-id)
@@ -421,7 +424,7 @@
 (defn deps
   "Given a State and a Task, returns a vector of Tasks that this task depends
   on. Tasks are nil where the task is no longer known."
-  [state ^Task task]
+  [state ^ITask task]
   (mapv (partial get-task state) (.dep-ids task)))
 
 (defn pending?
@@ -446,7 +449,7 @@
   dependency edge dep -> task iff dep is still pending, returning the new dep
   graph."
   [^DirectedGraph dep-graph ^ITask dep ^ITask task]
-  (assert+ (instance? Task dep)
+  (assert+ (instance? ITask dep)
            IllegalArgumentException
            (str "Dependencies must be tasks, but got " (pr-str deps)))
   (if (.contains (.vertices dep-graph) dep)
@@ -519,8 +522,9 @@
          dep-graph' (loopr [^DirectedGraph g (.. dep-graph linear (add task))]
                            [dep deps]
                            (recur (add-dep-edge g dep task))
-                           (.forked g))]
-     (add-task-helper state dep-graph' task))))
+                           (.forked g))
+         state' (add-task-helper state dep-graph' task)]
+     state')))
 
 (defn submit
   "Like submit*, but also returns the created task: [state new-task]. This form
@@ -556,8 +560,10 @@
             (str "Dependency must be a task, but got " (pr-str dep)))
    (let [task  (Catch. (.next-task-id state) name data (.id dep) f
                        (.output ^InternalTask dep) (promise) (.executor state))
-         dep-graph (add-dep-edge (.dep-graph state) dep task)]
-     (add-task-helper state dep-graph task))))
+         dep-graph (.add ^DirectedGraph (.dep-graph state) task)
+         dep-graph (add-dep-edge dep-graph dep task)
+         state' (add-task-helper state dep-graph task)]
+     state')))
 
 (defn catch
   "Like catch*, but also returns the created catch task: [state catch-task].
@@ -576,7 +582,7 @@
   "Takes a state and a task which has been executed, and marks it as completed.
   This deletes the state from the running set and returns the resulting state.
   It may also result in new tasks being ready."
-  [^State state, ^Task task]
+  [^State state, ^ITask task]
   (let [; Definitely shouldn't be ready
         ^ISet ready    (.ready-tasks state)
         _ (assert (not (.contains ready task)))
@@ -614,7 +620,7 @@
 (defn cancel
   "Takes a state and a task to cancel. Deletes the task, and any tasks which
   depend on it, from every part of the state."
-  [^State state, ^Task task]
+  [^State state, ^ITask task]
   (let [^DirectedGraph dep-graph (.dep-graph state)
         ; A Function which finds tasks depending on this one
         dependents (reify Function
@@ -813,7 +819,7 @@
                           (assoc state :effects (List.))))]
      (doseq [effect @effects]
       (apply-effects! executor effect))))
-  ([^Executor executor, [type, ^Task task]]
+  ([^Executor executor, [type, ^ITask task]]
    ;(info :effect type task)
    (case type
      ; Nothing to do for a new task--it's just an effect so callers can read

@@ -69,18 +69,24 @@
 
 (deftest exception-test
   (let [e (t/executor)]
-    (testing "Deref propagation"
+    #_(testing "deref propagation"
       (let [a (t/submit! e :a     (fn [_] (assert false)))
             _ (is (thrown? AssertionError @a))
             b (t/submit! e :b [a] (fn [a-in] :b))]
         _ (is (thrown? AssertionError @b))))
 
-    (testing "Catch"
-      (let [p (promise)
-            a (t/submit! e :a (fn [_] @p (/ 1 0)))
-            b (t/catch!  e :b a (fn [err] [:caught (.getMessage err)]))]
-        (deliver p nil)
-        (is (= [:caught "Divide by zero"] @b))))))
+    (testing "catch"
+      (testing "after running"
+        (let [a (t/submit! e :a (fn [_] (/ 1 0)))
+              b (t/catch!  e :b a (fn [err] [:caught (.getMessage err)]))]
+          (is (= [:caught "Divide by zero"] (deref b 1000 :timeout)))))
+
+      #_(testing "while pending"
+        (let [p (promise)
+              a (t/submit! e :a (fn [_] @p (/ 1 0)))
+              b (t/catch!  e :b a (fn [err] [:caught (.getMessage err)]))]
+          (deliver p nil)
+          (is (= [:caught "Divide by zero"] @b)))))))
 
 (deftest cancel-test
   (let [e    (t/executor)
