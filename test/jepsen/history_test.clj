@@ -27,7 +27,7 @@
                                Map)
            (java.io StringWriter)
            (java.util ArrayList)
-           (jepsen.history History)
+           (jepsen.history IHistory)
            ))
 
 (def n
@@ -41,6 +41,34 @@
 
 ;; Simple example-based tests
 
+(deftest pprint-test
+  (is (= "{:process nil,\n :type :invoke,\n :f :read,\n :value nil,\n :index nil,\n :time nil}\n"
+        (with-out-str (pprint (h/op {:type :invoke, :f :read, :value nil})))))
+
+  (testing "extra fields"
+    (is (= "{:process nil,\n :type nil,\n :f nil,\n :value nil,\n :extra 3,\n :index nil,\n :time 2}\n"
+           (with-out-str (pprint (h/op {:time 2 :extra 3})))))))
+
+(deftest history-test
+  (testing "no indices"
+    (let [h (h/history [{:process 0, :type :invoke, :f :read}
+                        {:process 0, :type :ok, :f :read, :value 5}])]
+      (is (= [{:index 0, :process 0, :type :invoke, :f :read, :value nil,
+               :time nil}
+              {:index 1, :process 0, :type :ok, :f :read, :value 5,
+               :time nil}]
+             (h/as-maps h)))
+      (is (h/dense-indices? h))))
+
+  (testing "sparse indices"
+    (let [h (h/history [{:index 5, :process 0, :type :invoke, :f :read}
+                        {:index 7, :process 0, :type :ok, :f :read, :value 5}])]
+      (is (= [{:index 5, :process 0, :type :invoke, :f :read, :value nil,
+               :time nil}
+              {:index 7, :process 0, :type :ok, :f :read, :value 5,
+               :time nil}]
+             (h/as-maps h)))
+      (is (not (h/dense-indices? h))))))
 
 ;; Generative tests
 
@@ -247,7 +275,7 @@
              (aset-int pair-index (:index op) -1)))
     pair-index))
 
-(deftest ^:focus pair-index-test
+(deftest pair-index-test
   (checking "pair index" n
             [ops        Ops-gen
              chunk-size (gen/choose 1 (max 1 (count ops)))]
@@ -264,7 +292,7 @@
             [(IntMap.) 0]
             ops)))
 
-(deftest ^:focus sparse-history-by-index-fold-spec
+(deftest sparse-history-by-index-fold-spec
   (checking "by-index" n
             [ops        sparse-Ops-gen
              chunk-size (gen/choose 1 (max 1 (count ops)))]
@@ -311,7 +339,7 @@
     (is (= (r/fold set/union process-set a)
            (r/fold set/union process-set b))))
 
-  (when (instance? History a)
+  (when (instance? IHistory a)
     (testing "pair-index"
       (doseq [i (map :index a)]
         (is (= (h/pair-index a i) (h/pair-index b i)))))
@@ -442,7 +470,7 @@
   (gen/let [ops ops-gen]
     (h/dense-history ops)))
 
-(deftest ^:focus dense-history-test
+(deftest dense-history-test
   (checking "dense history" n
             [ops Ops-gen]
             (let [h (h/dense-history ops)]
@@ -454,7 +482,7 @@
                 (is (= (range (count h))
                        (mapv :index (seq h))))))))
 
-(deftest ^:focus sparse-history-test
+(deftest sparse-history-test
   (checking "clients" n
             [ops sparse-Ops-gen]
             (let [h (h/sparse-history ops)]
@@ -468,7 +496,7 @@
                   h1 (h/sparse-history ops)]
               (check-history h0 h1))))
 
-(deftest ^:focus map-test
+(deftest map-test
   (checking "rewrite" n
             [ops Ops-gen]
             (let [h (h/map rewrite-op (h/dense-history ops))]
@@ -478,7 +506,7 @@
                 (let [h0 (h/dense-history (map rewrite-op ops))]
                   (check-history-equiv h0 h))))))
 
-(deftest ^:focus filter-test
+(deftest filter-test
   (checking "dense -> clients" n
             [ops Ops-gen]
             (let [h (h/filter h/client-op? (h/dense-history ops))]
@@ -503,7 +531,7 @@
     :reads          [(vec (filter read? model))
                      (h/filter (comp #{:r} :f) history)]))
 
-(deftest ^:focus transform-history-test
+(deftest transform-history-test
   ; Generates a series of basic ops, then a series of transformations on top of
   ; it. Applies transforms to both a model and a history, and verifies that the
   ; product checks out.

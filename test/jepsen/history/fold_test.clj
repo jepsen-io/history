@@ -39,12 +39,12 @@
               {:legs 4, :name :brown-one-by-the-fish-shop}]
         chunked-dogs (hc/chunked 2 dogs)
         f (f/folder chunked-dogs)]
-    (testing "reduce"
-      (is (= 6 (reduce (fn reduce-test
-                         ([] 0)
-                         ([max-legs dog]
-                          (max max-legs (:legs dog))))
-                       f))))
+    ;(testing "reduce"
+    ;  (is (= 6 (reduce (fn reduce-test
+    ;                     ([] 0)
+    ;                     ([max-legs dog]
+    ;                      (max max-legs (:legs dog))))
+    ;                   f))))
     (testing "reduce init"
       (is (= 6 (reduce (fn reduce-init-test [max-legs dog]
                          (max max-legs (:legs dog)))

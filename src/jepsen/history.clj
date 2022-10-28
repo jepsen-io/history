@@ -1,96 +1,209 @@
 (ns jepsen.history
-  "Support functions for working with histories.
+  "Support functions for working with histories. This provides two things you
+  need for writing efficient checkers:
 
-  We provide a dedicated Op defrecord which speeds up the most commonly
-  accessed fields.
+  1. A dedicated Op defrecord which speeds up the most commonly accessed
+  fields and reduces memory footprint.
 
-  We also provide a special History datatype. This type wraps an ordered
-  collection, and acts like a vector. However, it also provides
-  automatically-computed, memoized auxiliary structures, like a pair index
-  which allows callers to quickly map between invocations and completions.
+  2. A History datatype which generally works like a vector, but also supports
+  efficient fetching of operations by index, mapping back and forth between
+  invocations and completions, efficient lazy map/filter, fusable concurrent
+  reduce/fold, and a dependency-oriented task executor.
 
-  ## Scheduling
+  ## Ops
 
-  There are several challenges for Jepsen checkers.
+  Create operations with the `op` function. Unlike most defrecords, we
+  pretty-print these as if they were maps--we print a LOT of them.
 
-  1. We have no idea how many other checkers are executing, or what kind of
-     data they intend to compute. This causes duplicated work and many passes
-     over the underlying history.
+    (require '[jepsen.history :as h])
+    (def o (h/op {:process 0 :type :invoke, :f :read, :value [:x nil]}))
+    (pprint o)
+    ; {:process 0,
+    ;  :type :invoke,
+    ;  :f :read,
+    ;  :value [:x nil],
+    ;  :index nil,
+    ;  :time nil}
 
-  2. We're running on fixed hardware with a finite pool of CPUs, and want to
-     spawn a reasonable number of tasks, take advantage of at least *some*
-     memory and cache locality, etc.
+  We provide a few common functions for interacting with operations:
 
-  3. Checkers want to be able to ask for the results of a fold at any time, and
-     block until it's ready.
+    (invoke? o)    ; true
+    (client-op? o) ; true
+    (info? o)      ; false
 
-  4. But a regular function call like `reduce` won't work: a caller might do
-     (reduce a history) (reduce b history) and we wouldn't know that a and b
-     could have been executed in one pass.
+  And of course you can use fast field accessors here too:
 
-  5. Sometimes we want delay-like behavior. Histories can declare, for
-     instance, that they have a pair index or a count available, but those
-     computations shouldn't be performed until someone asks for them.
+    (.process o) ; 0
 
-  6. Sometimes we want future-like behavior: we know we'll use the results of a
-     computation, and starting it now is more efficient than waiting for
-     someone to ask for it.
+  ## Histories
 
-  All of this suggests to me that the normal approaches to concurrent execution
-  (e.g. just spawning a bunch of futures or delays) are not going to work: we
-  need a new, richer kind of control flow here. The need to coordinate between
-  callers who are not aware of each other also tells us that whatever executes
-  folds should be a shared, mutable thing rather than a pure, immutable
-  structure. For example, we might want:
+  Given a collection of operations, create a history like so:
 
-                  +-------------------------+   +-----------------------+
-                  |    Original History     |---|   Dataflow Executor   |
-                  +-------------------------+   +-----------------------+
-                            ^     ^
-                  +---------|     |---------+
-                  |                         |
-    +-------------------------+    +--------------------------+
-    | History w/just clients  |    |  History w/just writes   |
-    +-------------------------+    +--------------------------+
-        ^                               ^
-        +--Build a pair index           +--Build a pair index
-        |                               |
-        +--With that, find G1a          +--With that, compute latencies
-        |
-        +--Count ok ops
+    (def h (h/history [{:process 0, :type :invoke, :f :read}
+                       {:process 0, :type :ok, :f :read, :value 5}]))
 
-  Two different checkers construct different histories derived from the main
-  history--the left checker makes a view just with client ops, and the right
-  checker makes a view with just writes. Both are implemented as lazy views
-  over the original history.
+  `history` automatically lifts maps into Ops if they aren't already, and adds
+  indices if you omit them. There are options to control how indices are added;
+  see `history` for details.
 
-  Then the clients start performing queries. They submit these queries to their
-  individual histories, which in turn pass them up (with some translation) to
-  the original history, which hands them to the dataflow executor. Let's say:
+    (pprint h)
+    ; [{:process 0, :type :invoke, :f :read, :value nil, :index 0, :time nil}
+    ;  {:process 0, :type :ok, :f :read, :value 5, :index 1, :time nil}]
 
-  1. The left checker asks for G1a first. The dataflow executor realizes it
-     needs to compute a pair index first, so it begins that pass over the raw
-     history.
+  If you need to convert these back to plain-old maps for writing tests, use
+  `as-maps`.
 
-  2. The left checker asks for a count of OK ops. The executor completes its
-     pair-index pass of the first chunk, checks its state, and realizes that
-     since neither has a dependency on the other, these operations can be
-     unified into a single pass. It counts the first chunk, then merges the
-     pair-index and count folds into a single fold and begins the remaining
-     chunks.
+    (h/as-maps h)
+    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
+    ;  {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}]
 
-  3. The right checker asks for latencies. Since this depends on the pair
-     index, which is currently under computation, the executor defers the fold
-     for later.
+  Histories work almost exactly like vectors (though you can't assoc or conj
+  into them).
 
-  4. The executor completes its first pass and delivers the results of the pair
-     index and count. It discovers that the G1a and latencies can also be
-     computed in a single pass, constructs a merged fold, and begins executing
-     them. Once they complete, their results are delivered to the two checkers.
+    (count h)
+    ; 2
+    (nth h 1)
+    ; {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}
+    (map :type h)
+    ; [:invoke :ok]
 
-  This pre-emption and merging of fold passes is important: without it, we
-  would need callers to block and coordinate when they actually asked for
-  results."
+  But they have a few extra powers. You can get the Op with a particular :index
+  regardless of where it is in the collection.
+
+    (h/get-index h 0)
+    ; {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
+
+  And you can find the corresponding invocation for a completion, and
+  vice-versa:
+
+    (h/invocation h {:index 1, :time nil, :type :ok, :process 0, :f :read,
+                     :value 5})
+    ; {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
+
+    (h/completion h {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil})
+    ; {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}
+
+  We call histories where the :index fields are 0, 1, 2, ... 'dense', and other
+  histories 'sparse'. With dense histories, `get-index` is just `nth`. Sparse
+  histories are common when you're restricting yourself to just a subset of the
+  history, like operations on clients. If you pass sparse indices to `(history
+  ops)`, then ask for an op by index, it'll do a one-time fold over the ops to
+  find their indices, then cache a lookup table to make future lookups fast.
+
+    (def h (history [{:index 3, :process 0, :type :invoke, :f :cas,
+                      :value [7 8]}]))
+    (h/dense-indices? h)
+    ; false
+    (get-index h 3)
+    ; {:index 3, :time nil, :type :invoke, :process 0, :f :cas, :value [7 8]}
+
+  Let's get a slightly more involved history. This one has a concurrent nemesis
+  crashing while process 0 writes 3.
+
+    (def h (h/history
+             [{:process 0, :type :invoke, :f :write, :value 3}
+              {:process :nemesis, :type :info, :f :crash}
+              {:process 0, :type :ok, :f :write, :value 3}
+              {:process :nemesis, :type :info, :f :crash}]))
+
+  Of course we can filter this to just client operations using regular seq
+  operations...
+
+    (filter h/client-op? h)
+    ; [{:process 0, :type :invoke, :f :write, :value 3, :index 0, :time nil}
+    ;  {:process 0, :type :ok, :f :write, :value 3, :index 2, :time nil}]
+
+  But `jepsen.history` also exposes a more efficient version:
+
+    (h/filter h/client-op? h)
+    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :write, :value 3}
+    ;  {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}]
+
+  There are also shortcuts for common filtering ops: `client-ops`, `invokes`,
+  `oks`, `infos`, and so on.
+
+    (def ch (h/client-ops h))
+    (type ch)
+    ; jepsen.history.FilteredHistory
+
+  Creating a filtered history is O(1), and acts as a lazy view on top of the
+  underlying history. Like `clojure.core/filter`, it materializes elements as
+  needed. Unlike Clojure's `filter`, it does not (for most ops) cache results
+  in memory, so we can work with collections bigger than RAM. Instead, each
+  seq/reduce/fold/etc applies the filtering function to the underlying history
+  on-demand.
+
+  When you ask for a count, or to fetch operations by index, or to map between
+  invocations and completions, a FilteredHistory computes a small, reduced data
+  structure on the fly, and caches it to make later operations of the same type
+  fast.
+
+    (count ch) ; Folds over entire history to count how many match the predicate
+    ; 2
+    (count ch) ; Cached
+
+    ; (h/completion ch (first ch)) ; Folds over history to pair up ops, caches
+    {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}
+
+    ; (h/get-index ch 2) ; No fold required; underlying history does get-index
+    {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}
+
+  Similarly, `h/map` constructs an O(1) lazy view over another history. These
+  compose just like normal Clojure `map`/`filter`, and all share structure with
+  the underlying history.
+
+  ### Folds
+
+  All histories support `reduce`, `clojure.core.reducers/fold`, Tesser's
+  `tesser`, and `jepsen.history.fold/fold`. All four mechanisms are backed by
+  a `jepsen.history.fold` Folder, which allows concurrent folds to be joined
+  together on-the-fly and executed in fewer passes over the underlying data.
+  Reducers, Tesser, and history folds can also be executed in parallel.
+
+  Histories created with `map` and `filter` share the folder of their
+  underlying history, which means that two threads analyzing different views of
+  the same underlying history can have their folds joined into a single pass
+  automatically. This should hopefully be invisible to users, other than making
+  things Automatically Faster.
+
+  If you filter a history to a small subset of operations, or are comfortable
+  working in-memory, it may be sensible to materialize a history. Just use
+  `(vec h)` to convert a history a plain-old Clojure vector again.
+
+  ### Tasks
+
+  Analyzers often perform several independent reductions over a history, and
+  then compute new values based on those previous reductions. You can of course
+  use `future` for this, but histories also come with a shared,
+  dependency-aware threadpool executor for executing compute-bound concurrent
+  tasks. All histories derived from the same history share the same executor,
+  which means multiple checkers can launch tasks on it without launching a
+  bazillion threads. For instance, we might need to know if a history includes
+  crashes:
+
+    (def first-crash (h/task! h :find-first-crash (fn [_]
+      (->> h (h/filter (comp #{:crash} :f)) first))))
+
+  Like futures, deref'ing a task yields its result, or throws.
+
+    @first-crash
+    {:index 1, :time nil, :type :info, :process :nemesis, :f :crash,
+     :value nil}
+
+  Unlike futures, tasks can express *dependencies* on other tasks:
+
+    (def ops-before-crash (h/task! h :writes [first-crash]
+      (fn [[first-crash]]
+        (let [i (:index first-crash)]
+          (into [] (take-while #(< (:index %) i)) h)))))
+
+  This task won't run until first-crash has completed, and receives the result
+  of the first-crash task as its argument.
+
+    @ops-before-crash
+    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :write, :value 3}]
+
+  See `jepsen.history.task` for more details."
   (:refer-clojure :exclude [map filter remove])
   (:require [clojure [core :as c]
                      [pprint :as pprint :refer [pprint
@@ -139,14 +252,20 @@
 (alter-meta! #'pprint/*current-length* #(dissoc % :private))
 (defn pprint-kv
   "Helper for pretty-printing op fields."
-  [^Writer out k v]
-  (pprint/write-out k)
-  (.write out " ")
-  ;(pprint-newline :linear)
-  (set! pprint/*current-length* 0)
-  (pprint/write-out v)
-  (.write out ", ")
-  (pprint-newline :linear))
+  ([^Writer out k v]
+   (pprint/write-out k)
+   (.write out " ")
+   ;(pprint-newline :linear)
+   (set! pprint/*current-length* 0)
+   (pprint/write-out v)
+   (.write out ", ")
+   (pprint-newline :linear))
+  ([^Writer out k v last?]
+   (pprint/write-out k)
+   (.write out " ")
+   ;(pprint-newline :linear)
+   (set! pprint/*current-length* 0)
+   (pprint/write-out v)))
 
 ; We're going to print a TON of these, and it's really just noise to see the Op
 ; record formatting.
@@ -156,29 +275,28 @@
   (let [^Writer out *out*]
   ; See https://github.com/clojure/clojure/blob/5ffe3833508495ca7c635d47ad7a1c8b820eab76/src/clj/clojure/pprint/dispatch.clj#L105
     (pprint-logical-block :prefix "{" :suffix "}"
-      (pprint-kv out :process (.process op))
-      (pprint-kv out :type    (.type op))
-      (pprint-kv out :f       (.f op))
-      (pprint-kv out :value   (.value op))
-      ; Other fields
-      (print-length-loop [pairs (seq (.__extmap op))]
-        (when pairs
-          (pprint-logical-block
-            (pprint/write-out (ffirst pairs))
-            (.write out " ")
-            (pprint-newline :linear)
-            (pprint/write-out (fnext (first pairs))))
-          (when-let [pairs' (next pairs)]
-            (.write out ", ")
-            (pprint-newline :linear)
-            (recur pairs'))))
-      ; Always at the end
-      (pprint-kv out :index   (.index op))
-      (pprint-kv out :time    (.time op))
-    )))
+      (let [pairs (seq (.__extmap op))]
+        (pprint-kv out :process (.process op))
+        (pprint-kv out :type    (.type op))
+        (pprint-kv out :f       (.f op))
+        (pprint-kv out :value   (.value op))
+        ; Other fields
+        (print-length-loop [pairs pairs]
+                           (when pairs
+                             (pprint-logical-block
+                               (pprint/write-out (ffirst pairs))
+                               (.write out " ")
+                               (pprint-newline :linear)
+                               (pprint/write-out (fnext (first pairs))))
+                               (.write out ", ")
+                               (pprint-newline :linear)
+                               (recur (next pairs))))
+        ; Always at the end
+        (pprint-kv out :index   (.index op))
+        (pprint-kv out :time    (.time op) false)))))
 
 (defmethod print-method jepsen.history.Op [op ^java.io.Writer w]
-  (.write w (str (into {} op))))
+(.write w (str (into {} op))))
 
 (defn op
   "Constructs an operation. With one argument, expects a map, and turns that
@@ -238,6 +356,12 @@
            IllegalArgumentException
            (str "Expected a completion, but got " (pr-str op)))
   op)
+
+(defn as-maps
+  "Turns a collection of Ops back into plain old Clojure maps. Helpful for
+  writing tests."
+  [ops]
+  (mapv (partial into {}) ops))
 
 ;; Common folds
 
@@ -470,18 +594,23 @@
   ([ops]
    (preprocess-ops ops {}))
   ([ops {:keys [have-indices? already-ops?]}]
-   (let [; First, lift into an indexed collection
-         ops (if (indexed? ops)
-               ops
-               (vec ops))
-         ; Then ensure they're Ops
+   (let [; Ensure they're Ops
          ops (if already-ops?
                ops
                (mapv op ops))
          ; And that they have indexes
-         ops (if have-indices?
+         ops (cond have-indices? ops
+                   ; Guess
+                   (integer? (:index (first ops)))
+                   (assert-indices ops)
+
+                   ; Add
+                   true
+                   (add-dense-indices ops))
+         ; Finally lift into an indexed collection, in case we get a lazy seq
+         ops (if (indexed? ops)
                ops
-               (assert-indices ops))]
+               (vec ops))]
      ops)))
 
 ;; Dense histories. These have indexes 0, 1, ..., and allow for direct,
@@ -702,7 +831,9 @@
   "Constructs a sparse history backed by the given collection of ops. Options:
 
     :have-indices?  If true, these ops already have :index fields.
-    :already-ops?   If true, these ops are already Op records."
+    :already-ops?   If true, these ops are already Op records.
+
+  Adds dense indices if the ops don't already have their own indexes."
   ([ops]
    (sparse-history ops {}))
   ([ops options]

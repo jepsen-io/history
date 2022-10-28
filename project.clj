@@ -22,7 +22,7 @@
                     [org.slf4j/slf4j-simple "2.0.3"]
                     [cheshire "5.11.0"]
                     ]}}
-  :repl-options {:init-ns jepsen.history}
+  :repl-options {:init-ns user}
   ; We deliberatly want a reasonable heap here, because our tests are going to
   ; blow it up.
   :jvm-opts ["-Xmx8g" "-server"

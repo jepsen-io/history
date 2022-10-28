@@ -7,6 +7,20 @@ various tools (including Jepsen itself) that work with histories. Its
 documentation also describes the structure and semantics of histories, so that
 other people can interpret them.
 
+## What's Here
+
+- [jepsen.history](src/jepsen/history.clj) provides an Op datatype and a family
+  of history types with efficient get-by-index, invocation-completion mapping,
+  optimized concurrent folds, and memory-efficient, lazy map/filter, plus
+  dependency-aware futures. It uses...
+- [jepsen.history.fold](src/jepsen/history/fold.clj) is a stateful executor for
+  running linear and concurrent folds over large chunked collections (like
+  histories). It automatically fuses together concurrent folds into fewer
+  passes over the underlying dataset.
+- [jepsen.history.task](src/jepsen/history/task.clj) offers a dependency-aware,
+  transactional ThreadPoolExecutor for compute-bound tasks (like analysis of
+  histories).
+
 ## Example
 
 A short, real history from a transactional test of a system might be:
@@ -139,15 +153,16 @@ invocation corresponding to this completion", and it'll do that fast.
 This library tries to be reasonably fast (at least for Clojure)--supporting
 parallel techniques, memoization, and compact data structures.
 
-Realistic history sizes are up to a few million operations. It might be nice to
-go bigger, but right now it's not critical.
+Realistic history sizes are up to, say, a hundred million operations. It might
+be nice to go bigger, but right now it's not critical.
 
 In general, analyses of Jepsen histories is done in-memory. Recent work in
 Jepsen has brough us to streaming-capable on-disk storage, but basically every
 checker is going to immediately materialize huge chunks of the history in RAM.
 I'd like to explore doing analyses meaningfully *without* materializing the
-whole history in memory, but a.) this imposes complex performance costs, and
-b.) I'm not super concerned.
+whole history in memory. This library has been written with an eye towards
+writing checkers that never materialize the whole dataset in RAM, and to fuse
+together multiple reductions into a single IO pass over the data.
 
 ## Derived Histories
 
@@ -161,11 +176,11 @@ These compose across intermediate structures: if you start with history A, then
 derive B from A, then C from B, asking for C for its original history returns
 A.
 
-Histories provide their own versions of map, filter, and group-by which track
-these original-history relationships. We try to provide these as lazy views
-where possible, but they can also be materialized to in-memory structures
-explicitly. Unlike lazy seqs, our views try to maintain efficient random access
-and preserve auxiliary structures where possible.
+Histories provide their own versions of map and filter track these
+original-history relationships. We try to provide these as lazy views where
+possible, but they can also be materialized to in-memory structures explicitly.
+Unlike lazy seqs, our views try to maintain efficient random access and
+preserve auxiliary structures where possible.
 
 ## Dataflow
 
