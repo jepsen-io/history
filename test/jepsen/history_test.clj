@@ -18,7 +18,8 @@
             [dom-top.core :refer [assert+ letr loopr real-pmap]]
             [jepsen.history :as h]
             [jepsen.history [core :as hc]
-                            [fold :as f]]
+                            [fold :as f]
+                            [test-support :refer [n]]]
             [tesser.core :as t])
   (:import (io.lacuna.bifurcan IEntry
                                ISet
@@ -29,15 +30,6 @@
            (java.util ArrayList)
            (jepsen.history IHistory)
            ))
-
-(def n
-  "How aggressive should tests be? We always do at least this many trials. QC
-  scales up scaling factors to 200. Some of our tests are orders of magnitude
-  more expensive than others, so we scale many tests to N x 10 or whatever."
-  ;5
-  100
-  ;500
-  )
 
 ;; Simple example-based tests
 

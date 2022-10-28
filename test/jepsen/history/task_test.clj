@@ -10,10 +10,6 @@
             [dom-top.core :refer [loopr]]
             [jepsen.history.task :as t]))
 
-(def trials
-  "How aggressive should we be?"
-  100)
-
 (deftest basic-test
   (let [e     (t/executor)
         log   (atom [])
