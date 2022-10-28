@@ -128,7 +128,7 @@ Checkers often need to do things like:
   data from each reduction stage to influence the second stage, and possibly a
   third, etc.
 
-## Library Design
+## Library Goals
 
 Overall this library aims for a small-but-useful footprint which de-duplicates
 analysis routines that are often split up between Jepsen itself and checkers
@@ -163,69 +163,6 @@ I'd like to explore doing analyses meaningfully *without* materializing the
 whole history in memory. This library has been written with an eye towards
 writing checkers that never materialize the whole dataset in RAM, and to fuse
 together multiple reductions into a single IO pass over the data.
-
-## Derived Histories
-
-We often want to derive one history from another. For instance, we might
-renumber its indices, transform its f and values into a format that an existing
-checker understands, or select just client operations. When we do this, it's
-helpful to be able to map an operation back to the original.
-
-To support this, histories have `original-op` and `original-history` functions.
-These compose across intermediate structures: if you start with history A, then
-derive B from A, then C from B, asking for C for its original history returns
-A.
-
-Histories provide their own versions of map and filter track these
-original-history relationships. We try to provide these as lazy views where
-possible, but they can also be materialized to in-memory structures explicitly.
-Unlike lazy seqs, our views try to maintain efficient random access and
-preserve auxiliary structures where possible.
-
-## Dataflow
-
-Checkers often need some index structures or statistics computed by this
-library (for instance, a pair index which efficiently maps invocations to
-completions). They *also* want to perform their own reductions--let's say, for
-instance, that a checker counts the number of failed ops. Naively, we'd write:
-
-```clj
-(let [pair-index (reduce ... history)
-      failed-count (reduce ... history)]
-  do-analysis)
-```
-
-Because traversing the history itself might be expensive (for instance, if it's
-materialized on disk and required deserialization, or goes through lots of lazy
-transformations), we want to minimize the number of passes.
-
-```clj
-(let [[pair-index failed-count] (reduce combined-fold history)]
-  do-analysis)
-```
-
-The history structure can fuse its own reductions, but a.) it doesn't know
-which data will be needed by the user until the user asks for it, and b.) it
-doesn't know about the reductions the user would like to do. We could let the
-user do the reductions, but then they're in charge of storing and manipulating
-the pair index, and they can't that it as efficiently as we can. A cleanly
-layered design here is also, unfortunately, slow.
-
-To that end we define a dataflow structure which keeps track of these folds.
-Each fold has a unique name (for instance :pair-index) and a definition of how
-to perform the fold itself---we use [Tesser](https://github.com/aphyr/tesser),
-which is oriented towards high-performance reductions over explicitly chunked
-data. The dataflow structure also defines a directed acyclic graph of folds, so
-you can depend on the results of one fold in a later fold.
-
-When you ask for the results of a fold, we compute it lazily and cache the
-result. Folds can ask for the results of other folds. We use the fold
-dependency graph to sequence the execution of these folds, and perform as few
-passes over the data as possible.
-
-Because some history operations themselves depend on folds, we couple the
-dataflow structure to the history itself: each history has an associated
-dataflow.
 
 ## License
 
