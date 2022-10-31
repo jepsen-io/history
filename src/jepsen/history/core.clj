@@ -26,7 +26,7 @@
 
   clojure.lang.Associative
   (containsKey [this k]
-               (< -1 k (count this)))
+               (< -1 k (.count this)))
 
   (entryAt [this k]
            (.nth this k))
@@ -43,19 +43,28 @@
        (.nth this i nil))
 
   clojure.lang.IPersistentCollection
+  (cons [this x]
+        (.cons (vec this) x))
+
+  (empty [this] [])
+
   (equiv [this x]
          (and (vector? x)
               (= x (into [] this))))
 
   clojure.lang.IPersistentStack
   (peek [this]
-        (when (pos? count)
-          (nth this (dec count))))
+        (let [c (.count this)]
+          (when (pos? c)
+            (nth this (dec c)))))
 
   (pop [this]
        (pop (vec this)))
 
   clojure.lang.IPersistentVector
+  (assocN [this, i, x]
+          (.assocN (vec this) i x))
+
   (length [this]
           (.count this))
 
@@ -65,10 +74,14 @@
 
   clojure.lang.ILookup
   (valAt [this k]
-         (.valAt this k nil))
+         (.nth this k nil))
 
   (valAt [this k default]
          (.nth this k default))
+
+  clojure.lang.Reversible
+  (rseq [this]
+        (rseq (vec this)))
 
   clojure.lang.Sequential
 
@@ -193,7 +206,7 @@
       (.append sb "(SoftVector ")
       (.append sb (pr-str name))
       (.append sb " [")
-      (doseq [r refs]
+      (doseq [^SoftReference r refs]
         (.append sb (if (.get r) "▒" " ")))
       (.append sb "])"))))
 

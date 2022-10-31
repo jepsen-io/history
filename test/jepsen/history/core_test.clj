@@ -66,7 +66,9 @@
                 (doseq [i (range (count xs))]
                   (is (= (nth xs i) (nth v i)))
                   (is (= (get xs i) (get v i)))
-                  (is (= (xs i) (v i)))))
+                  (is (= (xs i) (v i)))
+                  (is (= (nth xs i ::not-found) (nth v i ::not-found)))
+                  (is (= (get xs i ::not-found) (get v i ::not-found)))))
 
               (testing "equality"
                 (is (= xs v))
@@ -90,4 +92,19 @@
                 (is (= (into [] xs) (into [] v)))
                 (is (= (reduce + xs) (reduce + v))))
 
+              (testing "empty"
+                (is (= (empty xs) (empty v))))
+
+              (testing "cons"
+                (is (= (conj xs ::unique) (conj v ::unique))))
+
+              (testing "assoc"
+                (doseq [i (range (count xs))]
+                  (is (= (assoc xs i ::unique)
+                         (assoc v i ::unique)))))
+
+              (testing "stack"
+                (is (= (peek xs) (peek v)))
+                (when-not (empty? xs)
+                  (is (= (pop xs) (pop v)))))
                 )))

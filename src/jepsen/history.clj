@@ -980,7 +980,7 @@
   (reduce [this f init]
           (.reduce ^IReduceInit history ((c/filter pred) f) init))
 
-  Reversible
+  clojure.lang.Reversible
   (rseq [this]
         (c/filter pred (rseq history)))
 

@@ -314,13 +314,16 @@
     (doseq [i (range (count a))]
       (is (= (nth a i) (nth b i)))
       (is (= (get a i) (get b i)))
-      (is (= (a i) (b i)))))
+      (is (= (a i) (b i)))
+      (is (= (nth a i ::missing) (nth b i ::missing)))
+      (is (= (get a i ::missing) (get b i ::missing)))))
   (testing "seq"
     (is (= (seq a) (seq b))))
   (testing "iterator"
     (is (= (iterator-seq (.iterator a))
            (iterator-seq (.iterator b)))))
 
+  ; Reductions
   (testing "reduce"
     ; trivial reducer
     (is (= (into [] a) (into [] b)))
@@ -330,6 +333,20 @@
   (testing "coll-fold"
     (is (= (r/fold set/union process-set a)
            (r/fold set/union process-set b))))
+
+  ; Changes
+  (testing "empty"
+    (is (= (empty a) (empty b))))
+  (testing "conj"
+    (is (= (conj a ::x) (conj b ::x))))
+  (testing "assoc"
+    (doseq [i (range (count a))]
+      (is (= (assoc a i ::x)
+             (assoc b i ::x)))))
+  (testing "stack"
+    (is (= (peek a) (peek b)))
+    (when-not (empty? a)
+      (is (= (pop a) (pop b)))))
 
   (when (instance? IHistory a)
     (testing "pair-index"
@@ -415,7 +432,6 @@
               (when other
                 (let [[a b] (sort-by :index [op other])]
                   (check-invoke-complete h a b)))))))))
-
 
 (defn check-history
   "Checks that something works like the given vector of operations."

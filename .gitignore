@@ -9,6 +9,7 @@ pom.xml.asc
 *.swp
 *.hprof
 /dogs
+/test-history
 /.lein-*
 /.nrepl-port
 /.prepl-port
