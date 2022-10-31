@@ -541,3 +541,138 @@
             (let [[model history] (reduce transform-history [ops ops]
                                           (cons init-transform transforms))]
               (check-history model history))))
+
+(def failed-write-mod
+  "Which intervals should be failed writes?"
+  7001)
+
+(defn gen-history-file!
+  "Writes out a history file of n records, starting at index starting-index,
+  containing a few failed writes."
+  [filename n starting-index]
+  (io/make-parents filename)
+  (print ".") (flush)
+  ;(info "Writing" filename)
+  (with-open [w (io/writer filename)]
+    (loop [i starting-index]
+      (when (< i (+ starting-index n))
+        (let [op (case (mod i 4)
+                   ; A write invocation
+                   0 {:index i, :type :invoke, :process 0, :f :write, :value i}
+                   ; A read invocation
+                   1 {:index i, :type :invoke, :process 1, :f :read, :value nil}
+                   ; A write completion
+                   2 {:index i, :type (if (= 0 (mod i failed-write-mod))
+                                        :fail
+                                        :ok)
+                      :process 0, :f :write, :value (- i 2)}
+                   ; A read completion
+                   3 {:index i, :type :ok, :process 1, :f :read,
+                      :value (- i 3)})]
+          (json/generate-stream op w)
+          (.write w "\n"))
+        (recur (inc i)))))
+  filename)
+
+(defn gen-history-files!
+  "Constructs a history of n writes, each containing about rough-chunk-size ops
+  of a read-write history, with a very small probability of failing a write.
+  Returns a soft-chunked-vector over those files."
+  [n rough-chunk-size]
+  ; First, clear existing files
+  (->> (file-seq (io/file "test-history"))
+       (filter #(.isFile %))
+       (mapv io/delete-file))
+  (let [n                 (long n)
+        rough-chunk-size  (long rough-chunk-size)
+        counts (->> (repeatedly #(-> rough-chunk-size
+                                     (- (rand-int 10))
+                                     (max 1)))
+                     (take (/ n rough-chunk-size))
+                     vec)
+        rough-n (reduce + counts)
+        trim    (- rough-n n)
+        counts  (update counts (dec (count counts)) - trim)
+        indices (vec (butlast (reductions + 0 counts)))
+        ; _ (prn :n n :counts counts :indices indices)
+        files   (vec (pmap (fn [n starting-index]
+                             (gen-history-file!
+                               (str "test-history/" starting-index ".json")
+                               n
+                               starting-index))
+                           counts indices))
+        load-chunk (fn load-chunk [i]
+                     (->> (json/parsed-seq (io/reader (files i)) true)
+                          (map (fn op [op]
+                                 (h/op (assoc op
+                                              :type (keyword (:type op))
+                                              :f    (keyword (:f op))))))))
+        scv (hc/soft-chunked-vector n indices load-chunk)]
+    (h/history scv {:have-indices?  true
+                    :already-ops?   true
+                    :dense-indices? true})))
+
+(defn print-mem-stats
+  "Prints out some basic memory stats"
+  []
+  (let [heap-size (.maxMemory (Runtime/getRuntime))
+        free-size (.freeMemory (Runtime/getRuntime))]
+    (info "Free:"    (long (/ free-size 1024 1024))
+          "MB, max:" (long (/ heap-size 1024 1024)) "MB")))
+
+(defn find-g1a
+  "Finds aborted reads in a history."
+  [h]
+  (let [failed-write-h (h/filter (fn [op]
+                                   (and (h/fail? op)
+                                        (= :write (:f op))))
+                                 h)
+        failed-writes (h/task! h :failed-writes
+                               (fn failed-writes [_]
+                                 (->> (t/map :value)
+                                      (t/set)
+                                      (h/tesser failed-write-h))))
+        g1a (h/task! h :g1a [failed-writes]
+                     (fn g1a [[failed]]
+                       (->> (t/filter h/ok?)
+                            (t/filter (fn filt [op]
+                                             (and (= :read (:f op))
+                                                  (failed (:value op)))))
+                            (t/into [])
+                            (t/post-combine (partial sort-by :index))
+                            (h/tesser h))))]
+    @g1a))
+
+; This test creates a massive (bigger than RAM) on-disk history with a small
+; number of aborted reads, then builds a soft-chunked-vector around those
+; files, wraps that in a history, and finds those aborted reads using a couple
+; folds.
+(deftest ^:slow integrative-test
+  (let [_ (info "Writing history to disk...")
+        h (gen-history-files! 1e8 1e6)]
+        ;h (gen-history-files! 1e3 1e2)]
+    (info "\nWrote" (count h) "ops to disk")
+    ; On my box, this burns through 100 million ops in about 145 seconds;
+    ; roughly 690,000 ops/sec.
+    (testing "g1a"
+      (info "Finding G1a")
+      (let [g1a (time (find-g1a h))]
+        ; (pprint g1a)
+        (is (= #{:read} (set (map :f g1a))))
+        ; We know exactly which writes fail
+        (is (= (->> (range 0 (count h) failed-write-mod)
+                    (filter #(= 2 (mod % 4)))
+                    (map #(- % 2)))
+               (map :value g1a)))))
+
+    (testing "in-memory"
+      (let [reporter (future
+                       (while true
+                         (print-mem-stats)
+                         (Thread/sleep 5000)))]
+        (try
+          (info "Loading into memory...")
+          (time
+            (is (thrown? OutOfMemoryError (prn (count (vec h))))))
+          (finally
+            (future-cancel reporter)))))))
