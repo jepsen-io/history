@@ -318,6 +318,11 @@
 (defmethod print-method jepsen.history.Op [op ^java.io.Writer w]
 (.write w (str (into {} op))))
 
+(defn op?
+  "Is this op an Op defrecord?"
+  [op]
+  (instance? Op op))
+
 (defn invoke?
   "Is this op an invocation?"
   [op]
