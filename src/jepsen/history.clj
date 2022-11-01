@@ -16,14 +16,15 @@
   pretty-print these as if they were maps--we print a LOT of them.
 
     (require '[jepsen.history :as h])
-    (def o (h/op {:process 0 :type :invoke, :f :read, :value [:x nil]}))
+    (def o (h/op {:process 0, :type :invoke, :f :read, :value [:x nil],
+                  :index 0, :time 0}))
     (pprint o)
     ; {:process 0,
     ;  :type :invoke,
     ;  :f :read,
     ;  :value [:x nil],
-    ;  :index nil,
-    ;  :time nil}
+    ;  :index 0,
+    ;  :time 0}
 
   We provide a few common functions for interacting with operations:
 
@@ -43,19 +44,19 @@
                        {:process 0, :type :ok, :f :read, :value 5}]))
 
   `history` automatically lifts maps into Ops if they aren't already, and adds
-  indices if you omit them. There are options to control how indices are added;
-  see `history` for details.
+  indices (sequential) and times (-1) if you omit them. There are options to
+  control how indices are added; see `history` for details.
 
     (pprint h)
-    ; [{:process 0, :type :invoke, :f :read, :value nil, :index 0, :time nil}
-    ;  {:process 0, :type :ok, :f :read, :value 5, :index 1, :time nil}]
+    ; [{:process 0, :type :invoke, :f :read, :value nil, :index 0, :time -1}
+    ;  {:process 0, :type :ok, :f :read, :value 5, :index 1, :time -1}]
 
   If you need to convert these back to plain-old maps for writing tests, use
   `as-maps`.
 
     (h/as-maps h)
-    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
-    ;  {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}]
+    ; [{:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
+    ;  {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}]
 
   Histories work almost exactly like vectors (though you can't assoc or conj
   into them).
@@ -63,7 +64,7 @@
     (count h)
     ; 2
     (nth h 1)
-    ; {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}
+    ; {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}
     (map :type h)
     ; [:invoke :ok]
 
@@ -71,17 +72,17 @@
   regardless of where it is in the collection.
 
     (h/get-index h 0)
-    ; {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
+    ; {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
 
   And you can find the corresponding invocation for a completion, and
   vice-versa:
 
-    (h/invocation h {:index 1, :time nil, :type :ok, :process 0, :f :read,
+    (h/invocation h {:index 1, :time -1, :type :ok, :process 0, :f :read,
                      :value 5})
-    ; {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil}
+    ; {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
 
-    (h/completion h {:index 0, :time nil, :type :invoke, :process 0, :f :read, :value nil})
-    ; {:index 1, :time nil, :type :ok, :process 0, :f :read, :value 5}
+    (h/completion h {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil})
+    ; {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}
 
   We call histories where the :index fields are 0, 1, 2, ... 'dense', and other
   histories 'sparse'. With dense histories, `get-index` is just `nth`. Sparse
@@ -95,7 +96,7 @@
     (h/dense-indices? h)
     ; false
     (get-index h 3)
-    ; {:index 3, :time nil, :type :invoke, :process 0, :f :cas, :value [7 8]}
+    ; {:index 3, :time -1, :type :invoke, :process 0, :f :cas, :value [7 8]}
 
   Let's get a slightly more involved history. This one has a concurrent nemesis
   crashing while process 0 writes 3.
@@ -110,14 +111,14 @@
   operations...
 
     (filter h/client-op? h)
-    ; [{:process 0, :type :invoke, :f :write, :value 3, :index 0, :time nil}
-    ;  {:process 0, :type :ok, :f :write, :value 3, :index 2, :time nil}]
+    ; [{:process 0, :type :invoke, :f :write, :value 3, :index 0, :time -1}
+    ;  {:process 0, :type :ok, :f :write, :value 3, :index 2, :time -1}]
 
   But `jepsen.history` also exposes a more efficient version:
 
     (h/filter h/client-op? h)
-    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :write, :value 3}
-    ;  {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}]
+    ; [{:index 0, :time -1, :type :invoke, :process 0, :f :write, :value 3}
+    ;  {:index 2, :time -1, :type :ok, :process 0, :f :write, :value 3}]
 
   There are also shortcuts for common filtering ops: `client-ops`, `invokes`,
   `oks`, `infos`, and so on.
@@ -143,10 +144,10 @@
     (count ch) ; Cached
 
     ; (h/completion ch (first ch)) ; Folds over history to pair up ops, caches
-    {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}
+    {:index 2, :time -1, :type :ok, :process 0, :f :write, :value 3}
 
     ; (h/get-index ch 2) ; No fold required; underlying history does get-index
-    {:index 2, :time nil, :type :ok, :process 0, :f :write, :value 3}
+    {:index 2, :time -1, :type :ok, :process 0, :f :write, :value 3}
 
   Similarly, `h/map` constructs an O(1) lazy view over another history. These
   compose just like normal Clojure `map`/`filter`, and all share structure with
@@ -187,7 +188,7 @@
   Like futures, deref'ing a task yields its result, or throws.
 
     @first-crash
-    {:index 1, :time nil, :type :info, :process :nemesis, :f :crash,
+    {:index 1, :time -1, :type :info, :process :nemesis, :f :crash,
      :value nil}
 
   Unlike futures, tasks can express *dependencies* on other tasks:
@@ -201,7 +202,7 @@
   of the first-crash task as its argument.
 
     @ops-before-crash
-    ; [{:index 0, :time nil, :type :invoke, :process 0, :f :write, :value 3}]
+    ; [{:index 0, :time -1, :type :invoke, :process 0, :f :write, :value 3}]
 
   See `jepsen.history.task` for more details."
   (:refer-clojure :exclude [map filter remove])
