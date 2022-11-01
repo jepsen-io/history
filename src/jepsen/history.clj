@@ -377,7 +377,19 @@
   "Turns a collection of Ops back into plain old Clojure maps. Helpful for
   writing tests."
   [ops]
-  (mapv (partial into {}) ops))
+  (c/map (partial into {}) ops))
+
+(defn strip-indices
+  "Strips off indices from a history, returning a sequence of plain maps.
+  Helpful for writing tests."
+  [ops]
+  (c/map (fn [op] (dissoc op :index)) ops))
+
+(defn strip-times
+  "Strips off times from a history, returning a sequence of plain maps. Helpful
+  for writing tests."
+  [ops]
+  (c/map (fn [op] (dissoc op :time)) ops))
 
 ;; Common folds
 
