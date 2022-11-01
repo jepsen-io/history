@@ -247,7 +247,27 @@
 
 ;; Operations
 
-(defrecord Op [^:int index ^:long time type process f value])
+(defrecord Op [^long index ^long time type process f value])
+
+(defn op
+  "Constructs an operation. With one argument, expects a map, and turns that
+  map into an Op record, which is somewhat faster to work with. If op is
+  already an Op, returns it unchanged.
+
+  Ops *must* have an index. Ops may be missing a :time; if so, we give them
+  time -1."
+  [op]
+  (if (instance? Op op)
+    op
+      (Op. (assert+ (:index op)
+                    "Ops require a long :index field")
+           (:time op -1)
+           (:type op)
+           (:process op)
+           (:f op)
+           (:value op)
+           nil
+           (dissoc op :index :time :type :process :f :value))))
 
 (alter-meta! #'pprint/*current-length* #(dissoc % :private))
 (defn pprint-kv
@@ -297,20 +317,6 @@
 
 (defmethod print-method jepsen.history.Op [op ^java.io.Writer w]
 (.write w (str (into {} op))))
-
-(defn op
-  "Constructs an operation. With one argument, expects a map, and turns that
-  map into an Op record, which is somewhat faster to work with. If op is
-  already an Op, returns it unchanged."
-  [op]
-  (if (instance? Op op)
-    op
-    (try
-      (map->Op op)
-      (catch IllegalArgumentException e
-        (throw+ {:type ::malformed-op
-                 :op   op}
-                e)))))
 
 (defn invoke?
   "Is this op an invocation?"
@@ -589,7 +595,8 @@
   These ops are guaranteed to:
 
   - Have :index fields
-  - Be records
+  - Have :time  fields
+  - Be Op records
   - Be in a Clojure Indexed collection
 
   Options are:
@@ -599,11 +606,7 @@
   ([ops]
    (preprocess-ops ops {}))
   ([ops {:keys [have-indices? already-ops?]}]
-   (let [; Ensure they're Ops
-         ops (if already-ops?
-               ops
-               (mapv op ops))
-         ; And that they have indexes
+   (let [; Ensure they have indexes
          ops (cond have-indices? ops
                    ; Guess
                    (integer? (:index (first ops)))
@@ -612,6 +615,10 @@
                    ; Add
                    true
                    (add-dense-indices ops))
+         ; Ensure they're Ops
+         ops (if already-ops?
+               ops
+               (mapv op ops))
          ; Finally lift into an indexed collection, in case we get a lazy seq
          ops (if (indexed? ops)
                ops
@@ -860,7 +867,9 @@
   history. Without either, we examine the first op and guess: if it has no
   :index, we'll assign sequential ones and construct a dense history. If the
   first op does have an :index, we'll use the existing indices and construct a
-  sparse history."
+  sparse history.
+
+  Operations with missing :time fields are given :time -1."
   ([ops]
    (history ops {}))
   ([ops {:keys [dense-indices? have-indices?] :as options}]

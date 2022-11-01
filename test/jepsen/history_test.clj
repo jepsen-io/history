@@ -33,22 +33,27 @@
 
 ;; Simple example-based tests
 
+(deftest op-test
+  (testing "no index"
+    (is (thrown? IllegalArgumentException
+                 (h/op {:type :invoke, :time 0, :f :read})))))
+
 (deftest pprint-test
-  (is (= "{:process nil,\n :type :invoke,\n :f :read,\n :value nil,\n :index nil,\n :time nil}\n"
-        (with-out-str (pprint (h/op {:type :invoke, :f :read, :value nil})))))
+  (is (= "{:process nil, :type :invoke, :f :read, :value nil, :index 1, :time 2}\n"
+        (with-out-str (pprint (h/op {:index 1, :time 2, :type :invoke, :f :read, :value nil})))))
 
   (testing "extra fields"
-    (is (= "{:process nil,\n :type nil,\n :f nil,\n :value nil,\n :extra 3,\n :index nil,\n :time 2}\n"
-           (with-out-str (pprint (h/op {:time 2 :extra 3})))))))
+    (is (= "{:process nil,\n :type nil,\n :f nil,\n :value nil,\n :extra 3,\n :index 1,\n :time 2}\n"
+           (with-out-str (pprint (h/op {:index 1, :time 2 :extra 3})))))))
 
 (deftest history-test
   (testing "no indices"
     (let [h (h/history [{:process 0, :type :invoke, :f :read}
                         {:process 0, :type :ok, :f :read, :value 5}])]
       (is (= [{:index 0, :process 0, :type :invoke, :f :read, :value nil,
-               :time nil}
+               :time -1}
               {:index 1, :process 0, :type :ok, :f :read, :value 5,
-               :time nil}]
+               :time -1}]
              (h/as-maps h)))
       (is (h/dense-indices? h))))
 
@@ -56,9 +61,9 @@
     (let [h (h/history [{:index 5, :process 0, :type :invoke, :f :read}
                         {:index 7, :process 0, :type :ok, :f :read, :value 5}])]
       (is (= [{:index 5, :process 0, :type :invoke, :f :read, :value nil,
-               :time nil}
+               :time -1}
               {:index 7, :process 0, :type :ok, :f :read, :value 5,
-               :time nil}]
+               :time -1}]
              (h/as-maps h)))
       (is (not (h/dense-indices? h))))))
 
@@ -98,7 +103,8 @@
     {:type    :invoke
      :process process
      :f       f
-     :value   value}))
+     :value   value
+     :time    -1}))
 
 (def nemesis-invoke-gen
   "Makes a random nemesis invocation"
@@ -108,7 +114,8 @@
     {:type    :info
      :process process
      :f       f
-     :value   value}))
+     :value   value
+     :time    -1}))
 
 (defn invoke-gen
   "Makes a random invocation"
@@ -129,12 +136,14 @@
       {:process process
        :type    type
        :f       f
-       :value   value})
+       :value   value
+       :time    -1})
     ; Nemesis
     (gen/return {:process process
                  :type    :info
                  :f       f
-                 :value   value})))
+                 :value   value
+                 :time    -1})))
 
 (def op-pair-gen
   "Generates a pair of matched invocation and completion."
