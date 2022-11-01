@@ -305,7 +305,12 @@
   [op]
   (if (instance? Op op)
     op
-    (map->Op op)))
+    (try
+      (map->Op op)
+      (catch IllegalArgumentException e
+        (throw+ {:type ::malformed-op
+                 :op   op}
+                e)))))
 
 (defn invoke?
   "Is this op an invocation?"
