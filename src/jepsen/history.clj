@@ -1165,3 +1165,11 @@
   (filter (fn possible? [op]
             (or (ok? op) (fail? op)))
           history))
+
+(defn filter-f
+  "Filters to a specific :f. Or, given a set, a set of :fs."
+  [f-or-fs history]
+  (filter (cond (set? f-or-fs)     (fn set [^Op op] (contains? f-or-fs (.f op)))
+                (keyword? f-or-fs) (fn kw [^Op op] (identical? f-or-fs (.f op)))
+                true               (fn equals [^Op op] (= f-or-fs (.f op))))
+          history))

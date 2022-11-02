@@ -67,6 +67,18 @@
              (h/as-maps h)))
       (is (not (h/dense-indices? h))))))
 
+(deftest ^:focus filter-f-test
+  (let [h (h/history [{:f :x}
+                      {:f [:complex]}
+                      {:f :y}])
+        [op0 op1 op2] h]
+    (testing "kw"
+      (is (= [op0] (h/filter-f :x h))))
+    (testing "compound"
+      (is (= [op1] (h/filter-f [:complex] h))))
+    (testing "set"
+      (is (= [op0 op2] (h/filter-f #{:x :y} h))))))
+
 ;; Generative tests
 
 (def small-pos-int

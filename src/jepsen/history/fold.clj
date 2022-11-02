@@ -176,7 +176,7 @@
   (:require [clojure [core :as c]
                      [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn]]
-            [dom-top.core :refer [assert+ loopr reducer]]
+            [dom-top.core :as dt :refer [assert+ loopr]]
             [jepsen.history [core :as hc]
                             [task :as task]]
             [slingshot.slingshot :refer [try+ throw+]]
@@ -1542,8 +1542,8 @@
   ne for the combiner. Turns each of those lists into a reducer fn using
   `dom-top.core/reducer`, then turns the whole thing into a fold."
   [metadata reducer-forms combiner-forms]
-  `(let [reducer-fn#  (reducer ~@reducer-forms)
-         combiner-fn# (reducer ~@combiner-forms)]
+  `(let [reducer-fn#  (dt/reducer ~@reducer-forms)
+         combiner-fn# (dt/reducer ~@combiner-forms)]
      (merge {:reducer-identity  reducer-fn#
              :reducer           reducer-fn#
              :post-reducer      reducer-fn#
