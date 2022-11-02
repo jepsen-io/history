@@ -258,6 +258,34 @@
     (assoc fold-mean-cuteness
            :associative? assoc?)))
 
+(def fold-mean-legs
+  "A mean-legs fold defined with loopf."
+  (f/loopf {:name         :fold-mean-legs
+            :associative? true
+            :asap?        true
+            :model        (fn [fold chunk-size dogs]
+                            (if (:combiner fold)
+                              (if (seq dogs)
+                                (/ (reduce + 0 (map :legs dogs))
+                                   (count dogs))
+                                :nan)
+                              [(count dogs) (reduce + 0 (map :legs dogs))]))}
+    ([sum 0, count 0]
+     [dog]
+     (recur (+ sum (:legs dog)) (inc count))
+     [count sum])
+    ([count 0, sum 0]
+     [[chunk-count chunk-sum]]
+     (recur (+ count chunk-count) (+ sum chunk-sum))
+     (if (pos? count)
+       (/ sum count)
+       :nan))))
+
+(def fold-mean-legs-gen
+  "Generates a fold that finds the average of all leg counts"
+  (gen/let [assoc? gen/boolean]
+    (assoc fold-mean-legs :associative? assoc?)))
+
 (defn fold-call-count
   "This fold ensures that each chunk is reduced exactly one time. It keeps an
   atom :counts which is a map of :reducer-identity, :reducer, etc counts for
@@ -353,6 +381,7 @@
                     [fold-type-gen
                      fold-count-gen
                      fold-mean-cuteness-gen
+                     fold-mean-legs-gen
                      fold-mut-legs-gen])]
      (cond-> (assoc fold :asap? asap?)
        (not combiner?) (dissoc fold

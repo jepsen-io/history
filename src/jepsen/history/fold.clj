@@ -172,11 +172,11 @@
   Like transducers, post-reducers and post-combiners act on the values inside
   Reduced wrappers; they cannot distinguish between reduced and non-reduced
   values."
-  (:refer-clojure :exclude [reduce])
+  (:refer-clojure :exclude [reduce for])
   (:require [clojure [core :as c]
                      [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn]]
-            [dom-top.core :refer [assert+ loopr]]
+            [dom-top.core :refer [assert+ loopr reducer]]
             [jepsen.history [core :as hc]
                             [task :as task]]
             [slingshot.slingshot :refer [try+ throw+]]
@@ -1534,3 +1534,20 @@
   (->> tesser-fold
        tesser/compile-fold
        (fold folder)))
+
+(defmacro loopf
+  "Macro for defining folds with for/loop-like syntax. Works like two
+  dom-top.core/reducer's glued together, plus metadata. Takes a map with
+  metadata (e.g. :name, :associative?, ...) and two lists: one for the reducer,
+  ne for the combiner. Turns each of those lists into a reducer fn using
+  `dom-top.core/reducer`, then turns the whole thing into a fold."
+  [metadata reducer-forms combiner-forms]
+  `(let [reducer-fn#  (reducer ~@reducer-forms)
+         combiner-fn# (reducer ~@combiner-forms)]
+     (merge {:reducer-identity  reducer-fn#
+             :reducer           reducer-fn#
+             :post-reducer      reducer-fn#
+             :combiner-identity combiner-fn#
+             :combiner          combiner-fn#
+             :post-combiner     combiner-fn#}
+            ~metadata)))

@@ -6,7 +6,7 @@
   :dependencies [; Logging
                  [org.clojure/tools.logging "1.2.4"]
                  ; Control flow, including fast single-threaded reductions
-                 [dom-top "1.0.7"]
+                 [dom-top "1.0.8-SNAPSHOT"]
                  ; Fast reductions
                  [tesser.core "1.0.5"]
                  ; Defining datatypes
