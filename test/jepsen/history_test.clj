@@ -67,7 +67,7 @@
              (h/as-maps h)))
       (is (not (h/dense-indices? h))))))
 
-(deftest ^:focus filter-f-test
+(deftest filter-f-test
   (let [h (h/history [{:f :x}
                       {:f [:complex]}
                       {:f :y}])

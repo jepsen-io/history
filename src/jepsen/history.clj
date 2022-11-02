@@ -354,6 +354,14 @@
   [op]
   (integer? (:process op)))
 
+(defn has-f?
+  "Constructs a function which takes ops and returns true if the op has the
+  given :f, or, given a set, any of the given :fs."
+  [f-or-fs]
+  (cond (set? f-or-fs)     (fn set [^Op op] (contains? f-or-fs (.f op)))
+        (keyword? f-or-fs) (fn kw [^Op op] (identical? f-or-fs (.f op)))
+        true               (fn equals [^Op op] (= f-or-fs (.f op)))))
+
 (defn assert-invoke+
   "Throws if something is not an invocation, or, for non-client operations, an
   info. Otherwise returns op."
@@ -1169,7 +1177,4 @@
 (defn filter-f
   "Filters to a specific :f. Or, given a set, a set of :fs."
   [f-or-fs history]
-  (filter (cond (set? f-or-fs)     (fn set [^Op op] (contains? f-or-fs (.f op)))
-                (keyword? f-or-fs) (fn kw [^Op op] (identical? f-or-fs (.f op)))
-                true               (fn equals [^Op op] (= f-or-fs (.f op))))
-          history))
+  (filter (has-f? f-or-fs) history))
