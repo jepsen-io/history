@@ -474,25 +474,36 @@
 
   (testing "tasks"
     (testing "basics"
-      (let [a (h/task! h :a (fn [_] :a))
-            b (h/task! h :b [a] (fn [[a]] [:b a]))]
+      (let [a (h/task-call h :a (fn [_] :a))
+            b (h/task-call h :b [a] (fn [[a]] [:b a]))]
         (is (= [:b :a] @b))
         (is (= :a @a))))
 
     (testing "catch"
-      (let [a (h/task! h :crash (fn [_] (/ 1 0)))
-            b (h/catch-task! h :catch a (fn [err] :caught))]
+      (let [a (h/task-call h :crash (fn [_] (/ 1 0)))
+            b (h/catch-task-call h :catch a (fn [err] :caught))]
         (is (= :caught @b))
         (is (thrown? ArithmeticException @a))))
 
     (testing "cancel"
       (let [p (promise)
-            a (h/task! h :a (fn [_] @p :a))
-            b (h/task! h :b [a] (fn [[a]] [a :b]))
-            b (h/task! h :c [b] (fn [[b]] [b :c]))]
-        (h/cancel-task! h a)
+            a (h/task-call h :a (fn [_] @p :a))
+            b (h/task-call h :b [a] (fn [[a]] [a :b]))
+            b (h/task-call h :c [b] (fn [[b]] [b :c]))]
+        (h/cancel-task h a)
         (p true)
-        (is (not (realized? b)))))))
+        (is (not (realized? b)))))
+
+    (testing "task sugar"
+      (let [a (h/task h a [] :a)
+            b (h/task h b :data [x a] [:b x])]
+        (is (= [:b :a] @b))))
+
+    (testing "catch sugar"
+      (let [a (h/task h a [] (/ 1 0))
+            b (h/catch-task h err-handler :data [err a]
+                            [:caught (.getMessage err)])]
+        (is (= [:caught "Divide by zero"] @b))))))
 
 (def dense-history-gen
   "Generator of dense histories."
@@ -664,20 +675,18 @@
                                    (and (h/fail? op)
                                         (= :write (:f op))))
                                  h)
-        failed-writes (h/task! h :failed-writes
-                               (fn failed-writes [_]
-                                 (->> (t/map :value)
-                                      (t/set)
-                                      (h/tesser failed-write-h))))
-        g1a (h/task! h :g1a [failed-writes]
-                     (fn g1a [[failed]]
-                       (->> (t/filter h/ok?)
-                            (t/filter (fn filt [op]
-                                             (and (= :read (:f op))
-                                                  (failed (:value op)))))
-                            (t/into [])
-                            (t/post-combine (partial sort-by :index))
-                            (h/tesser h))))]
+        failed-writes (h/task h failed-writes
+                              (->> (t/map :value)
+                                   (t/set)
+                                   (h/tesser failed-write-h)))
+        g1a (h/task h g1a [failed failed-writes]
+                    (->> (t/filter h/ok?)
+                         (t/filter (fn filt [op]
+                                     (and (= :read (:f op))
+                                          (failed (:value op)))))
+                         (t/into [])
+                         (t/post-combine (partial sort-by :index))
+                         (h/tesser h)))]
     @g1a))
 
 ; This test creates a massive (bigger than RAM) on-disk history with a small

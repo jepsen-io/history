@@ -182,8 +182,8 @@
   bazillion threads. For instance, we might need to know if a history includes
   crashes:
 
-    (def first-crash (h/task! h :find-first-crash (fn [_]
-      (->> h (h/filter (comp #{:crash} :f)) first))))
+    (def first-crash (h/task h find-first-crash []
+      (->> h (h/filter (comp #{:crash} :f)) first)))
 
   Like futures, deref'ing a task yields its result, or throws.
 
@@ -193,10 +193,9 @@
 
   Unlike futures, tasks can express *dependencies* on other tasks:
 
-    (def ops-before-crash (h/task! h :writes [first-crash]
-      (fn [[first-crash]]
-        (let [i (:index first-crash)]
-          (into [] (take-while #(< (:index %) i)) h)))))
+    (def ops-before-crash (h/task h writes [fc first-crash]
+      (let [i (:index first-crash)]
+        (into [] (take-while #(< (:index %) i)) h))))
 
   This task won't run until first-crash has completed, and receives the result
   of the first-crash task as its argument.
@@ -526,22 +525,23 @@
             details. All histories descending from the same history
             (e.g. via map or filter) share the same task executor.")
 
-  (task! [this name f]
-         [this name deps f]
-         [this name data deps f]
-         "Launches a Task on this history's task executor. Use this to perform
-         parallel, compute-bound processing of a history in a dependency
-         tree--for instance, to perform multiple folds over a history at the
-         same time. See jepsen.history.task/submit! for details.")
+  (task-call [this name f]
+             [this name deps f]
+             [this name data deps f]
+             "Launches a Task on this history's task executor. Use this to
+             perform parallel, compute-bound processing of a history in a
+             dependency tree--for instance, to perform multiple folds over a
+             history at the same time. See jepsen.history.task/submit! for
+             details.")
 
-  (catch-task! [this name dep f]
-               [this name data dep f]
-               "Adds a catch task to this history which handles errors on the
-               given dep. See jepsen.history.task/catch!.")
+  (catch-task-call [this name dep f]
+                   [this name data dep f]
+                   "Adds a catch task to this history which handles errors on
+                   the given dep. See jepsen.history.task/catch!.")
 
-  (cancel-task! [this task]
-                "Cancels a task on the this history's task executor. Returns
-                task."))
+  (cancel-task [this task]
+               "Cancels a task on the this history's task executor. Returns
+               task."))
 
 
 (def-abstract-type AbstractHistory
@@ -561,23 +561,23 @@
   Taskable
   (executor [this] executor)
 
-  (task! [this name f]
-         (task/submit! executor name f))
+  (task-call [this name f]
+             (task/submit! executor name f))
 
-  (task! [this name deps f]
-         (task/submit! executor name deps f))
+  (task-call [this name deps f]
+             (task/submit! executor name deps f))
 
-  (task! [this name data deps f]
-         (task/submit! executor name data deps f))
+  (task-call [this name data deps f]
+             (task/submit! executor name data deps f))
 
-  (catch-task! [this name dep f]
-               (task/catch! executor name dep f))
+  (catch-task-call [this name dep f]
+                   (task/catch! executor name dep f))
 
-  (catch-task! [this name data dep f]
-               (task/catch! executor name data dep f))
+  (catch-task-call [this name data dep f]
+                   (task/catch! executor name data dep f))
 
-  (cancel-task! [this task]
-                (task/cancel! executor task)))
+  (cancel-task [this task]
+               (task/cancel! executor task)))
 
 (defn add-dense-indices
   "Adds sequential indices to a series of operations. Throws if there are
@@ -1178,3 +1178,71 @@
   "Filters to a specific :f. Or, given a set, a set of :fs."
   [f-or-fs history]
   (filter (has-f? f-or-fs) history))
+
+(defn parse-task-args
+  "Helper for task and catch-task which parses varargs and extracts the data,
+  dep names, dep tasks, and body."
+  [args]
+  (let [; Figure out where the binding vector is
+        could-be-binding-name? (fn [form]
+                                 (or (symbol? form)
+                                     (vector? form)
+                                     (map? form)))
+        could-be-bindings? (fn [form]
+                             (and (vector? form)
+                                  (even? (count form))
+                                  (every? could-be-binding-name?
+                                          (take-nth 2 form))))
+        bindices (keep-indexed (fn [i form]
+                                 (when (could-be-bindings? form)
+                                   i))
+                               (take 2 args))
+        bindex (if (= 1 (count bindices))
+                 (first bindices)
+                 (throw (IllegalArgumentException.
+                            "Can't guess where your binding vector is")))
+        data      (when (= 1 bindex)
+                    (first args))
+        bindings  (nth args bindex)
+        dep-names (take-nth 2 bindings)
+        deps      (take-nth 2 (drop 1 bindings))
+        body      (drop (inc bindex) args)]
+    {:deps      deps
+     :dep-names dep-names
+     :data      data
+     :body      body}))
+
+(defmacro task
+  "A helper macro for launching new tasks. Takes a history, a symbol for your
+  task name, optional data, a binding vector of names to dependency tasks you'd
+  like to depend on, and a single-arity argument vector, and a body. Wraps body
+  in a function and submits it to the task executor.
+
+    (task history find-anomalies []
+       ... go do stuff)
+
+    (task history furthermore [as find-anomalies]
+      ... do stuff with as)
+
+    (task history data-task {:custom :data} [as anomalies, f furthermore]
+      ... do stuff with as and f)"
+  [history task-name & args]
+  (let [{:keys [dep-names deps data body]} (parse-task-args args)]
+    `(task-call ~history '~task-name ~data [~@deps]
+                (fn ~task-name [[~@dep-names]]
+                  ~@body))))
+
+(defmacro catch-task
+  "A helper for launching new catch tasks. Takes a history, a symbol for your
+  catch task's name, optional data, and a binding vector of [arg-name task],
+  followed by a body. Wraps body in a function and submits it as a new catch
+  task to the history's executor.
+
+    (catch-task history oh-no [err some-task]
+  (handle err ...))"
+  [history task-name & args]
+  (let [{:keys [dep-names deps data body]} (parse-task-args args)]
+    (assert (= 1 (count deps)))
+    `(catch-task-call ~history '~task-name ~data ~@deps
+                      (fn ~task-name [~@dep-names]
+                        ~@body))))
