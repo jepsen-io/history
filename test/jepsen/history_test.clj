@@ -721,4 +721,9 @@
           (time
             (is (thrown? OutOfMemoryError (prn (count (vec h))))))
           (finally
+            ; no really, GC, or our remaining tests will explode for lack of
+            ; memory
+            (while (< 1073741824 (.freeMemory (Runtime/getRuntime)))
+              (System/gc)
+              (Thread/sleep 100))
             (future-cancel reporter)))))))
