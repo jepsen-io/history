@@ -726,4 +726,5 @@
             (while (< 1073741824 (.freeMemory (Runtime/getRuntime)))
               (System/gc)
               (Thread/sleep 100))
-            (future-cancel reporter)))))))
+            (future-cancel reporter)
+            (print-mem-stats)))))))

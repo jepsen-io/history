@@ -10,7 +10,9 @@
             [tesser.utils :refer [chunk-vec
                                   chunk-array
                                   reducible-chunk]])
-  (:import (clojure.lang IHashEq)
+  (:import (clojure.lang IHashEq
+                         IPersistentCollection
+                         IPersistentVector)
            (java.lang.ref SoftReference)
            (java.util Arrays)))
 
@@ -44,7 +46,7 @@
 
   clojure.lang.IPersistentCollection
   (cons [this x]
-        (.cons (vec this) x))
+        (.cons ^IPersistentCollection (vec this) x))
 
   (empty [this] [])
 
@@ -63,7 +65,7 @@
 
   clojure.lang.IPersistentVector
   (assocN [this, i, x]
-          (.assocN (vec this) i x))
+          (.assocN ^IPersistentVector (vec this) i x))
 
   (length [this]
           (.count this))
