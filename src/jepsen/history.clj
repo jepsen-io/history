@@ -504,6 +504,12 @@
          "Given an index, returns the index of that operation's
          corresponding invocation or completion. -1 means no match.")
 
+  (ensure-pair-index [history]
+                     "Ensures the pair index exists. Helpful when you want to
+                     use the pair index during a fold, because loading the pair
+                     index itself would require another fold pass. Returns
+                     history.")
+
   (completion [history invocation]
               "Takes an invocation operation belonging to this history, and
               returns the operation which invoked it, or nil if none did.")
@@ -557,6 +563,11 @@
               (let [i (.pair-index this (:index completion))]
                 (when-not (= -1 i)
                   (.get-index this i))))
+
+  (ensure-pair-index [this]
+                     (when-let [o ^Op (first this)]
+                       (.pair-index this (.index o)))
+                     this)
 
   Taskable
   (executor [this] executor)
@@ -995,6 +1006,9 @@
 
   A mapped history inherits the same task executor as the original history."
   [f history]
+  (assert+ (instance? IHistory history)
+           {:type    ::not-history
+            :history history})
   (MappedHistory. history f (executor history)))
 
 ;; Filtered histories
@@ -1128,6 +1142,9 @@
 
   A filtered history inherits the task executor of the original."
   [f history]
+  (assert+ (instance? IHistory history)
+           {:type    ::not-history
+            :history history})
   (let [count- (delay (->> (tesser/filter f)
                            (tesser/count)
                            (tesser history)))
@@ -1171,7 +1188,7 @@
   "Filters a history to just :ok or :info ops"
   [history]
   (filter (fn possible? [op]
-            (or (ok? op) (fail? op)))
+            (or (ok? op) (info? op)))
           history))
 
 (defn filter-f

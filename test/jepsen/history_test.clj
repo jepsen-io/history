@@ -675,7 +675,7 @@
                                    (and (h/fail? op)
                                         (= :write (:f op))))
                                  h)
-        failed-writes (h/task h failed-writes
+        failed-writes (h/task h failed-writes []
                               (->> (t/map :value)
                                    (t/set)
                                    (h/tesser failed-write-h)))
@@ -695,7 +695,7 @@
 ; folds.
 (deftest ^:slow integrative-test
   (let [_ (info "Writing history to disk...")
-        h (gen-history-files! 1e8 1e6)]
+        h (gen-history-files! 2e8 1e6)]
         ;h (gen-history-files! 1e3 1e2)]
     (info "\nWrote" (count h) "ops to disk")
     ; On my box, this burns through 100 million ops in about 145 seconds;
