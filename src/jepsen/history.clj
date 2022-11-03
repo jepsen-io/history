@@ -1007,8 +1007,8 @@
   A mapped history inherits the same task executor as the original history."
   [f history]
   (assert+ (instance? IHistory history)
-           {:type    ::not-history
-            :history history})
+           {:type         ::not-history
+            :history-type (type history)})
   (MappedHistory. history f (executor history)))
 
 ;; Filtered histories
@@ -1143,8 +1143,8 @@
   A filtered history inherits the task executor of the original."
   [f history]
   (assert+ (instance? IHistory history)
-           {:type    ::not-history
-            :history history})
+           {:type         ::not-history
+            :history-type (type history)})
   (let [count- (delay (->> (tesser/filter f)
                            (tesser/count)
                            (tesser history)))
