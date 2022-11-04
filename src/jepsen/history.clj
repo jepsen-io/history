@@ -259,15 +259,10 @@
   [op]
   (if (instance? Op op)
     op
-      (Op. (assert+ (:index op)
-                    "Ops require a long :index field")
-           (:time op -1)
-           (:type op)
-           (:process op)
-           (:f op)
-           (:value op)
-           nil
-           (dissoc op :index :time :type :process :f :value))))
+    (do (assert+ (:index op) "Ops require a long :index field")
+        (Op/create (if (contains? op :time)
+                     op
+                     (assoc op :time -1))))))
 
 (alter-meta! #'pprint/*current-length* #(dissoc % :private))
 (defn pprint-kv
