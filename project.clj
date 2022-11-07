@@ -22,6 +22,9 @@
                     [org.slf4j/slf4j-simple "2.0.3"]
                     [cheshire "5.11.0"]
                     ]}}
+  ; We need to write some Java code later that depends on these interfaces &
+  ; defrecords.
+  ;:aot [jepsen.history]
   :repl-options {:init-ns user}
   ; We deliberatly want a reasonable heap here, because our tests are going to
   ; blow it up.

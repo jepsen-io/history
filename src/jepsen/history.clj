@@ -247,7 +247,10 @@
 
 ;; Operations
 
-(defrecord Op [^long index ^long time type process f value])
+(defrecord Op [^long index ^long time type process f value]
+  Object
+  (toString [this]
+    (pr-str this)))
 
 (defn op
   "Constructs an operation. With one argument, expects a map, and turns that
@@ -1241,7 +1244,7 @@
   [history task-name & args]
   (let [{:keys [dep-names deps data body]} (parse-task-args args)]
     `(task-call ~history '~task-name ~data [~@deps]
-                (fn ~task-name [[~@dep-names]]
+                (fn ~(symbol (str task-name "-task")) [[~@dep-names]]
                   ~@body))))
 
 (defmacro catch-task
