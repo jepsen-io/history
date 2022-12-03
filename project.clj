@@ -8,7 +8,7 @@
                  ; Control flow, including fast single-threaded reductions
                  [dom-top "1.0.8-SNAPSHOT"]
                  ; Fast reductions
-                 [tesser.core "1.0.5-SNAPSHOT"]
+                 [tesser.core "1.0.6-SNAPSHOT"]
                  ; Defining datatypes
                  [potemkin "0.4.6"]
                  ; Fast data structures
@@ -17,9 +17,9 @@
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.13"]
-                    [org.clojure/clojure "1.10.3"]
+                    [org.clojure/clojure "1.11.1"]
                     [org.clojure/test.check "1.1.1"]
-                    [org.slf4j/slf4j-simple "2.0.3"]
+                    [org.slf4j/slf4j-simple "2.0.5"]
                     [cheshire "5.11.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &

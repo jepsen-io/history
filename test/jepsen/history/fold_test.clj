@@ -25,7 +25,7 @@
 
 ;; Simple example-based tests
 
-(deftest basic-test
+(deftest ^:focus basic-test
   (let [dogs [{:legs 6, :name :noodle},
               {:legs 4, :name :stop-it},
               {:legs 4, :name :brown-one-by-the-fish-shop}]
@@ -47,7 +47,15 @@
       (let [xf (comp (map :name)
                      (remove #{:stop-it}))]
         (is (= [:noodle :brown-one-by-the-fish-shop]
-               (transduce xf conj [] f)))))
+               (transduce xf conj [] f))))
+      (testing "completing"
+        (let [xf (fn xf [rf0]
+                   (fn rf
+                     ([]      (rf0))
+                     ([acc]   [:completed acc])
+                     ([acc x] (rf0 acc (:legs x)))))]
+          (is (= [:completed [6 4 4]]
+                 (transduce xf conj [] f))))))
 
     (testing "into"
       (is (= #{4 6} (into #{} (map :legs) f))))))

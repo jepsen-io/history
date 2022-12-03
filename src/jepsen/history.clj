@@ -865,7 +865,7 @@
           ([] [0 (.linear (IntMap.))])
           ([[i, ^IntMap m]] (.forked m))
           ([[^long i, ^IntMap m] chunk-indices]
-           (loopr [j  0
+           (loopr [j          0
                    ^IntMap m' m]
                   [index chunk-indices]
                   (recur (inc j) (.put m' (long index) ^Object (+ i j)))

@@ -551,6 +551,7 @@
                [:combine]
                [last-reduce]
                (fn task [[reduce-acc]]
+                 ; (info "Linear combine" reduce-acc)
                  ; Unwrap reduced
                  (let [reduce-acc   (unreduced reduce-acc)
                        post-reduced (post-reducer reduce-acc)]
@@ -1389,7 +1390,9 @@
   (reduce [this f init]
     (fold this (assoc (make-fold f)
                       :name             :reduce
-                      :reducer-identity (constantly init))))
+                      :reducer-identity (constantly init)
+                      ; Reduce doesn't know about the (f acc) completing arity
+                      :post-reducer    identity)))
 
   clojure.core.reducers/CollFold
   (coll-fold [this n combinef reducef]
