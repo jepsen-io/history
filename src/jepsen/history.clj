@@ -868,7 +868,7 @@
            (loopr [j          0
                    ^IntMap m' m]
                   [index chunk-indices]
-                  (recur (inc j) (.put m' (long index) ^Object (+ i j)))
+                  (recur (inc j) (.put m' (long index) (Long. (+ i j))))
                   [(+ i j) m])))]
     {:name     :sparse-history-by-index
      :reducer  reducer
