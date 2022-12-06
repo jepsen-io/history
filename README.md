@@ -7,7 +7,7 @@ various tools (including Jepsen itself) that work with histories. Its
 documentation also describes the structure and semantics of histories, so that
 other people can interpret them.
 
-[![Clojars Project](https://img.shields.io/clojars/v/io.jepsen/history.svg)]
+![Clojars Project](https://img.shields.io/clojars/v/io.jepsen/history.svg)
 
 ## What's Here
 
