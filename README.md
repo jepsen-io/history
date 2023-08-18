@@ -155,20 +155,21 @@ invocation corresponding to this completion", and it'll do that fast.
 This library tries to be reasonably fast (at least for Clojure)--supporting
 parallel techniques, memoization, and compact data structures.
 
-Realistic history sizes are up to, say, a hundred million operations. It might
-be nice to go bigger, but right now it's not critical.
+We've recorded and analyzed histories up to a billion operations. Compatibility
+with extant JVM APIs imposes a theoretical upper bound of 2^31 - 1 operations,
+but we could conceivably go larger.
 
 In general, analyses of Jepsen histories is done in-memory. Recent work in
-Jepsen has brough us to streaming-capable on-disk storage, but basically every
-checker is going to immediately materialize huge chunks of the history in RAM.
-I'd like to explore doing analyses meaningfully *without* materializing the
-whole history in memory. This library has been written with an eye towards
-writing checkers that never materialize the whole dataset in RAM, and to fuse
-together multiple reductions into a single IO pass over the data.
+Jepsen has brough us to streaming-capable on-disk storage, but some checkers
+require materializing large chunks of the history in RAM. I'd like to explore
+doing analyses meaningfully *without* materializing the whole history in
+memory. This library has been written with an eye towards writing checkers that
+never materialize the whole dataset in RAM, and to fuse together multiple
+reductions into a single IO pass over the data.
 
 ## License
 
-Copyright © 2022 Jepsen, LLC
+Copyright © 2022, 2023 Jepsen, LLC
 
 This program and the accompanying materials are made available under the
 terms of the Eclipse Public License 2.0 which is available at
