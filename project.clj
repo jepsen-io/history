@@ -1,4 +1,4 @@
-(defproject io.jepsen/history "0.1.1-SNAPSHOT"
+(defproject io.jepsen/history "0.1.1"
   :description "A library for working with Jepsen's histories of concurrent systems."
   :url "https://github.com/jepsen-io/history"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
@@ -16,10 +16,10 @@
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
-                   [[com.gfredericks/test.chuck "0.2.13"]
+                   [[com.gfredericks/test.chuck "0.2.14"]
                     [org.clojure/clojure "1.11.1"]
                     [org.clojure/test.check "1.1.1"]
-                    [org.slf4j/slf4j-simple "2.0.5"]
+                    [org.slf4j/slf4j-simple "2.0.7"]
                     [cheshire "5.11.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &
