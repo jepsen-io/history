@@ -1153,7 +1153,12 @@
         ; joined reduce.
         ;_ (info :last-missing-reduce last-missing-reduce-i
         ;        :last-missing-combine last-missing-combine-i)
-        _ (loop [i 0]
+        _ (loop [i 0
+                ; We need compact vectors of non-nil reduce tasks repeatedly.
+                ; We maintain them incrementally to avoid an n^2 recomputation
+                ; each time. compact-reduce-tasks
+                compact-reduce-tasks     []
+                compact-new-reduce-tasks []]
             (when (< i n)
               (let [old-rt (aget old-reduce-tasks i)]
                 (if (and (< last-missing-reduce-i i)
@@ -1161,14 +1166,19 @@
                          (task-work-pending? state old-rt))
                   (do ; Replace with a fused reduce
                       (cancel-old-reduce-task! i)
-                      (aset reduce-tasks i
-                            (task! make-concurrent-reduce-task fused chunks
-                                   (vec (remove nil? reduce-tasks)) i)))
+                      (let [t (task! make-concurrent-reduce-task fused chunks
+                                     compact-reduce-tasks i)]
+                        (aset reduce-tasks i t)
+                        (recur (inc i)
+                               (conj compact-reduce-tasks t)
+                               compact-new-reduce-tasks)))
                   ; We need to start a new reduce task instead.
-                  (aset new-reduce-tasks i
-                        (task! make-concurrent-reduce-task new-fold chunks
-                               (vec (remove nil? new-reduce-tasks)) i))))
-              (recur (inc i))))
+                  (let [t (task! make-concurrent-reduce-task new-fold chunks
+                                 compact-new-reduce-tasks i)]
+                        (aset new-reduce-tasks i t)
+                        (recur (inc i)
+                               compact-reduce-tasks
+                               (conj compact-new-reduce-tasks t)))))))
 
         ; Look, this is gnarly, but I burned SO many hours getting all the
         ; fiddly edges right and I'm washing my hands of it. If you can make it
