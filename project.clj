@@ -1,4 +1,4 @@
-(defproject io.jepsen/history "0.1.2"
+(defproject io.jepsen/history "0.1.3-SNAPSHOT"
   :description "A library for working with Jepsen's histories of concurrent systems."
   :url "https://github.com/jepsen-io/history"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
