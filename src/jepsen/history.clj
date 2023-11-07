@@ -232,6 +232,7 @@
                          IReduce
                          IReduceInit
                          Indexed
+                         Murmur3
                          Reversible
                          Seqable
                          Sequential)
@@ -247,7 +248,25 @@
 
 ;; Operations
 
+(definterface+ IOp
+  (index= [this, other]
+          "Equality comparison by index only. Useful for speeding up large
+          structures of operations.")
+  (index-hash [this]
+              "Hash by index only. Useful for speeding up large structures of
+              operations."))
+
 (defrecord Op [^long index ^long time type process f value]
+  IOp
+  (index= [this other]
+    (assert (instance? Op other)
+            (str "Can only compare an Op to another Op, not a "
+                 (type other) ": " (pr-str other)))
+    (= index (.index ^Op other)))
+
+  (index-hash [this]
+    (Murmur3/hashLong index))
+
   Object
   (toString [this]
     (pr-str this)))

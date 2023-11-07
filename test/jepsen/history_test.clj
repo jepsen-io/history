@@ -46,6 +46,18 @@
     (is (= "{:process nil,\n :type nil,\n :f nil,\n :value nil,\n :extra 3,\n :index 1,\n :time 2}\n"
            (with-out-str (pprint (h/op {:index 1, :time 2 :extra 3})))))))
 
+(deftest ^:focus index-op-test
+  (let [a1 (h/op {:type :invoke, :index 0})
+        a2 (h/op {:type :ok, :index 0})
+        b  (h/op {:type :invoke, :index 1})]
+    (testing "index="
+      (is (h/index= a1 a2))
+      (is (not (h/index= a1 b))))
+    (testing "index-hash"
+      (is (= 0 (h/index-hash a1)))
+      (is (= 0 (h/index-hash a2)))
+      (is (= 1392991556 (h/index-hash b))))))
+
 (deftest history-test
   (testing "no indices"
     (let [h (h/history [{:process 0, :type :invoke, :f :read}
