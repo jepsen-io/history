@@ -3,51 +3,51 @@
   stateful executor for CPU-bound tasks backed by a num-cores
   ThreadPoolExecutor, and allows you to submit tasks to be run on that
   executor.
-
+  ```
     (require '[jepsen.history.task :as task])
     (def e (task/executor))
-
+  ```
   At a very high level, a task is a named function of optional dependencies
   (inputs) which returns an output. Here's a task with no dependencies:
-
+  ```
     (def pet (task/submit! e :pet-dog (fn [_] :petting-dog)))
-
+  ```
   Tasks are derefable with the standard blocking and nonblocking calls.
   Derefing a task returns its output. You can ask completion with `realized?`
-
+  ```
     @pet             ; :petting-dog
     (realized? pet)  ; true
-
+  ```
   If a task throws, its output is the Throwable it threw. Derefing that
   throwable also throws, like Clojure futures. Exceptions propagate to
   dependencies: dependencies will never execute, and if derefed, will throw as
   well.
-
+  ```
     (def doomed (task/submit! e :doomed (fn [_] (assert false))))
     ; All fine, until
     @doomed    ; throws Assert failed: false
-
+  ```
   Each task is assigned a unique long ID by its executor. Tasks should never be
   used across executors; their hashcodes and equality semantics are, for
   performance reasons, by ID *alone*.
-
+  ```
     (task/id pet)   ; 0
-
+  ```
   Tasks also have names, which can be any non-nil object, and are used for
   debugging & observability. Tasks can also carry an arbitrary data object,
   which can be anything you like. You can use this to build more sophisticated
   task management systems around this executor.
-
+  ```
     (task/name pet)   ; :pet-dog
 
     (def train (task/submit! e :train {:tricks [:down-stay :recall]} nil
                  (fn [_] :training-dog)))
     (task/data train)  ; {:tricks [:down-stay :recall]}
-
+  ```
   When submitted, tasks can depend on earlier tasks. When it executes, a task
   receives a vector of the outputs of its dependencies. A task only executes
   once its dependencies have completed, and will observe their memory effects.
-
+  ```
     (def dog-promise (promise))
     (def dog-task    (task/submit! e :make-dog    (fn [_] @dog-promise)))
     (def person-task (task/submit! e :make-person (fn [_] :nona)))
@@ -69,16 +69,16 @@
 
     ; Now we can deref the adoption task.
     @adopt-task    ; :adopted!
-
+  ```
   Tasks may be cancelled. Cancelling a task also cancels all tasks which depend
   on it. Unlike normal ThreadPoolExecutors, cancellation is *guaranteed* to be
   safe: if a task is still pending, it will never run. Cancelling a task which
   is running or has already run has no effect, other than removing it from the
   executor state. This may not be right for all applications; it's important
   for us.
-
+  ```
     (task/cancel! e adopt-task)
-
+  ```
   Tasks either run to completion or are cancelled; they are never interrupted.
   If they are, who knows what could happen? Almost certainly the executor will
   stall some tasks forever. Hopefully you're throwing away the executor and
@@ -90,7 +90,7 @@
   executor (fn [state] ...))`, which returns a new state. Any transformations
   you apply to the state take place atomically. Note that these functions use
   pure functions without `!`: `submit` instead of `submit!`, etc.
-
+  ```
     ; Create a task which blocks...
     (def dog-promise (promise))
     (def dog-task (task/submit! e :find-dog (fn [_] @dog-promise)))
@@ -112,9 +112,10 @@
                                     (prn :oh-no)
                                     :tomb-entered))]
           state'))))
-  ; prints :oh-no
-  (deliver dog-promise :noodle)
-  ; Adoption never happens!"
+    ; prints :oh-no
+    (deliver dog-promise :noodle)
+    ; Adoption never happens!
+  ```"
   (:refer-clojure :exclude [name])
   (:require [clojure [pprint :as pprint :refer [pprint]]]
             [clojure.tools.logging :refer [info warn fatal]]

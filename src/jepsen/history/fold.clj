@@ -10,7 +10,7 @@
   jepsen.history.core. Jepsen.history chunks vectors by default at 16384
   elements per chunk, which is a bit big for a demonstration, so let's chunk
   explicitly:
-
+  ```
     (require '[tesser.core :as t] '[jepsen.history [core :as hc] [fold :as f]])
     (def dogs [{:legs 6, :name :noodle},
                {:legs 4, :name :stop-it},
@@ -19,66 +19,66 @@
     (pprint (hc/chunks chunked-dogs))
     ; ([{:legs 6, :name :noodle} {:legs 4, :name :stop-it}]
     ;  [{:legs 4, :name :brown-one-by-the-fish-shop}])
-
+  ```
   In real use, chunks should be big enough to take a bit (a second or so?) to
   reduce. We keep track of some state for each chunk, so millions is probably
   too many. If you have fewer chunks than processors, we won't be able to
   optimize as efficiently.
 
   A folder wraps a chunked collection, like so:
-
+  ```
     (def f (f/folder chunked-dogs))
-
+  ```
   Now we can perform a reduction on the folder. This works just like Clojure
   reduce:
-
+  ```
     (reduce (fn [max-legs dog]
               (max max-legs (:legs dog)))
             0
-            e)
+            f)
     ; => 6
-
+  ```
   Which means transducers and into work like you'd expect:
-
+  ```
     (into #{} (map :legs) f)
     ; => #{4 6}
-
+  ```
   OK, great. What's the point? Imagine we had a collection where getting
   elements was expensive--for instance, if they required IO or expensive
   processing. Let's put ten million dogs on disk as JSON.
-
+  ```
     (require '[jepsen.history.fold-test :as ft])
     (def dogs (ft/gen-dogs-file! 1e7))
     (def f (f/folder dogs))
-
+  ```
   Reducing over ten million dogs as JSON takes about ten seconds on my
   machine.
-
+  ```
     (time (into #{} (map :legs) dogs))
     ; 10364 msecs
-
+  ```
   But with a folder, we can do something *neat*:
-
+  ```
     (def leg-set {:reducer-identity   (constantly #{})
                   :reducer            (fn [legs dog] (conj legs (:legs dog)))
                   :combiner           clojure.set/union})
     (time (f/fold f leg-set))
     ; 1660 msecs
-
+  ```
   This went roughly six times faster because the folder reduced each chunk in
   parallel. Now let's run, say, ten reductions in parallel.
-
+  ```
     (time (doall (pmap (fn [_] (into #{} (map :legs) dogs)) (range 10))))
     ; 28477 msecs
-
+  ```
   This 28 seconds is faster than running ten folds sequentially (which would
   have been roughly 87 seconds), because we've got multiple cores to do the
   reduction. But we're still paying a significant cost because each of those
   reductions has to re-parse the file as it goes.
-
+  ```
     (time (doall (pmap (fn [_] (f/fold f leg-set)) (range 10))))
     ; 2261 msecs
-
+  ```
   Twelve times faster than the parallel version! And roughly 45x faster than
   doing the reductions naively in serial. How? Because when you ask a folder to
   reduce something, and it's already running another reduction, it *joins* your
@@ -87,7 +87,7 @@
   concurrent folds--and it does it while ensuring strict order and thread
   safety for mutable accumulators. Let's replace that reduction with a mutable
   HashSet, and convert it back to a Clojure set at the end.
-
+  ```
     (import java.util.HashSet)
     (defn mut-hash-set [] (HashSet.))
     (def fast-leg-set {:reducer-identity mut-hash-set
@@ -99,56 +99,56 @@
                        :post-combiner    set})
     (time (doall (pmap (fn [_] (f/fold f fast-leg-set)) (range 10))))
     ; 2197 msecs
-
+  ```
   # In general
 
   A fold represents a reduction over a history, which can optionally be
   executed over chunks concurrently. It's a map with the following fields:
 
-    ; Metadata
+  ### Metadata
 
-    :name              The unique name of this fold. May be any object, but
-                       probably a keyword.
+    `:name`              The unique name of this fold. May be any object, but
+                         probably a keyword.
 
-    ; How to reduce a chunk
+  ### How to reduce a chunk
 
-    :reducer-identity  A function (f history) which generates an identity
-                       object for a reduction over a chunk.
+    `:reducer-identity`  A function `(f [])` which generates an identity
+                         object for a reduction over a chunk.
 
-    :reducer           A function (f history acc op) which takes a history, a
-                       chunk accumulator, and an operation from the history,
-                       and returns a new accumulator.
+    `:reducer`           A function `(f acc op)` which takes a
+                         chunk accumulator, and an operation from the history,
+                         and returns a new accumulator.
 
-    :post-reducer      A function (f history acc) which takes the final
-                       accumulator from a chunk and transforms it before being
-                       passed to the combiner
+    `:post-reducer`      A function `(f acc)` which takes the final
+                         accumulator from a chunk and transforms it before being
+                         passed to the combiner
 
-    ; How to combine chunks together
+  ### How to combine chunks together
 
-    :combiner-identity A function (f history) which generates an identity
-                       object for combining chunk results together.
+    `:combiner-identity` A function `(f [])` which generates an identity
+                         object for combining chunk results together.
 
-    :combiner          A function (f history acc chunk-result) which folds
-                       the result of a chunk into the combiner's accumulator.
-                       If nil, performs a left fold linearly, and does not
-                       combine at all.
+    `:combiner`          A function `(f acc chunk-result)` which folds
+                         the result of a chunk into the combiner's accumulator.
+                         If nil, performs a left fold linearly, and does not
+                         combine at all.
 
-    :post-combiner     A function (f history acc) which takes the final acc
-                       from merging all chunks and produces the fold's return
-                       value.
+    `:post-combiner`     A function `(f acc)` which takes the final acc
+                         from merging all chunks and produces the fold's return
+                         value.
 
-    ; Execution hints
+  ### Execution hints
 
-    :associative?      If true, the combine function is associative, and can
-                       be applied in any order. If false, we must combine
-                       left-to-right. Right now this does nothing; we haven't
-                       implemented associative combine.
+    `:associative?`      If true, the combine function is associative, and can
+                         be applied in any order. If false, we must combine
+                         left-to-right. Right now this does nothing; we haven't
+                         implemented associative combine.
 
-    :asap?             Folders ramp up processing of concurrent folds gradually
-                       to give other folds a chance to join the pass. Setting
-                       this to `true` disables that optimization, which means a
-                       fold can complete more quickly--at the cost of slowing
-                       down other folds.
+    `:asap?`             Folders ramp up processing of concurrent folds gradually
+                         to give other folds a chance to join the pass. Setting
+                         this to `true` disables that optimization, which means a
+                         fold can complete more quickly--at the cost of slowing
+                         down other folds.
 
   Folds should be pure functions of their histories, though reducers and
   combiners are allowed to use in-memory mutability; each is guaranteed to be
@@ -1529,8 +1529,8 @@
   "Executes a fold on the given folder synchronously. See `make-fold` for
   what a fold can be. Returns result of the fold.
 
-  This is the opposite arity from (reduce f coll): here we're sort of saying
-  (fold coll f). I've thought long and hard about this, and I think it makes
+  This is the opposite arity from `(reduce f coll)`: here we're sort of saying
+  `(fold coll f)`. I've thought long and hard about this, and I think it makes
   sense. With `reduce`, you're generally composing a collection and passing it
   to `reduce`. With `fold`, you're generally composing a *fold* and executing
   it on the same folder over and over. This feels like it's going to be more
