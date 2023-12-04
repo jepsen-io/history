@@ -12,9 +12,12 @@
                  ; Defining datatypes
                  [potemkin "0.4.6"]
                  ; Fast data structures
-                 [io.lacuna/bifurcan "0.2.0-alpha6"]
+                 [io.lacuna/bifurcan "0.2.0-alpha7"]
+                 ; Temp
+                 [org.clojure/clojure "1.11.1"]
                  ; Errors
                  [slingshot "0.12.2"]]
+  :aot [jepsen.history]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.14"]
                     [org.clojure/clojure "1.11.1"]
