@@ -1,4 +1,4 @@
-(defproject io.jepsen/history "0.1.3"
+(defproject io.jepsen/history "0.1.4-SNAPSHOT"
   :description "A library for working with Jepsen's histories of concurrent systems."
   :url "https://github.com/jepsen-io/history"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
@@ -13,8 +13,6 @@
                  [potemkin "0.4.7"]
                  ; Fast data structures
                  [io.lacuna/bifurcan "0.2.0-alpha7"]
-                 ; Temp
-                 [org.clojure/clojure "1.11.1"]
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
