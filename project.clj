@@ -17,7 +17,6 @@
                  [org.clojure/clojure "1.11.1"]
                  ; Errors
                  [slingshot "0.12.2"]]
-  :aot [jepsen.history]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.14"]
                     [org.clojure/clojure "1.11.1"]
