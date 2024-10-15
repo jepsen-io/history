@@ -350,6 +350,12 @@
       (is (= (a i) (b i)))
       (is (= (nth a i ::missing) (nth b i ::missing)))
       (is (= (get a i ::missing) (get b i ::missing)))))
+  (testing "destructuring bind"
+    (let [[a1 a2 & as] a
+          [b1 b2 & bs] b]
+      (is (= a1 b1))
+      (is (= a2 b2))
+      (is (= as bs))))
   (testing "seq"
     (is (= (seq a) (seq b))))
   (testing "iterator"
