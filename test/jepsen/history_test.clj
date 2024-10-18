@@ -31,6 +31,151 @@
            (jepsen.history IHistory)
            ))
 
+; Some basic transforms on ops
+(defn read?
+  "Is this a read operation?"
+  [op]
+  (identical? :r (:f op)))
+
+(defn write?
+  "Is this a write operation?"
+  [op]
+  (identical? :w (:f op)))
+
+(defn rewrite-op
+  "Adds a testing field to each operation and wraps the value"
+  [{:keys [process value] :as op}]
+  (assoc op
+         :process (if (integer? process)
+                    (inc process)
+                    process)
+         :value [:rewrite value]))
+
+(defn process-set
+  "A reducing fn for finding the set of all processes in a history."
+  ([] #{})
+  ([ps op]
+   (conj ps (:process op))))
+
+
+(defn check-history-equiv
+  "Checks that two histories are equivalent. a can be a plain vector, in which
+  case we skip history-specific tests."
+  [a b]
+  ;(prn :a (class a) a)
+  ;(prn :b (class b) b)
+  (testing "predicates"
+    (is (= (associative? a) (associative? b)))
+    (is (= (coll? a) (coll? b)))
+    (is (= (empty? a) (empty? b)))
+    (is (= (indexed? a) (indexed? b)))
+    (is (= (list? a) (list? b)))
+    (is (= (seqable? a) (seqable? b)))
+    (is (= (seq? a) (seq? b)))
+    (is (= (sequential? a) (sequential? b)))
+    (is (= (vector? a) (vector? b))))
+
+  (testing "count"
+    (is (= (count a) (count b))))
+  (testing "hash"
+    (is (= (hash a) (hash b)))
+    (is (= (.hashCode a) (.hashCode b))))
+  (testing "equality"
+    (is (= a b))
+    (is (= b a))
+    (is (.equals a b))
+    (is (.equals b a)))
+  (testing "string"
+    (is (= (str a) (str b))))
+  (testing "nth/get/fn"
+    (testing "out of bounds"
+      (is (= (nth a -1 :default)
+             (nth b -1 :default)))
+      (is (= (try (nth a (count a)) (catch Throwable e (class e)))
+             (try (nth b (count b)) (catch Throwable e (class e))))))
+    (doseq [i (range (count a))]
+      (is (= (nth a i) (nth b i)))
+      (is (= (get a i) (get b i)))
+      (is (= (a i) (b i)))
+      (is (= (nth a i ::missing) (nth b i ::missing)))
+      (is (= (get a i ::missing) (get b i ::missing)))))
+  (testing "destructuring bind"
+    (let [[a1 a2 & as] a
+          [b1 b2 & bs] b]
+      (is (= a1 b1))
+      (is (= a2 b2))
+      (is (= as bs)))
+    (let [[first-a :as as] a
+          [first-b :as bs] b]
+      (is (= first-a first-b))
+      (is (= as bs))))
+  (testing "seq"
+    (is (= (seq a) (seq b))))
+  (testing "iterator"
+    (is (= (iterator-seq (.iterator a))
+           (iterator-seq (.iterator b)))))
+
+  ; Reductions
+  (testing "reduce"
+    ; trivial reducer
+    (is (= (into [] a) (into [] b)))
+    ; a set of processes
+    (is (= (reduce process-set #{} a) (reduce process-set #{} b))))
+
+  (testing "coll-fold"
+    (is (= (r/fold set/union process-set a)
+           (r/fold set/union process-set b))))
+
+  ; Changes
+  (testing "empty"
+    (is (= (empty a) (empty b))))
+  (testing "conj"
+    (is (= (conj a ::x) (conj b ::x))))
+  (testing "assoc"
+    (doseq [i (range (count a))]
+      (is (= (assoc a i ::x)
+             (assoc b i ::x)))))
+  (testing "stack"
+    (is (= (peek a) (peek b)))
+    (when-not (empty? a)
+      (is (= (pop a) (pop b)))))
+
+  (when (instance? IHistory a)
+    (testing "pair-index"
+      (doseq [i (map :index a)]
+        (is (= (h/pair-index a i) (h/pair-index b i)))))
+
+    (testing "get-index"
+      (doseq [op a]
+        (let [i (:index op)]
+          (is (= op (h/get-index a i)))
+          (is (= op (h/get-index b i))))))
+
+    (testing "invocation & completion"
+      (doseq [op a]
+        (if (or (h/invoke? op) (not (h/client-op? op)))
+          (is (= (h/completion a op)
+                 (h/completion b op)))
+          (is (= (h/invocation a op)
+                 (h/invocation b op))))))
+
+    (testing "fold"
+      (testing "reduce equivalence"
+        (let [into-vec {:reducer-identity (constantly [])
+                        :reducer conj}]
+          (is (= (vec a)
+                 (h/fold a into-vec)
+                 (h/fold b into-vec)))))
+
+      (testing "complex"
+        (is (= (h/fold a h/pair-index-fold)
+               (h/fold b h/pair-index-fold)))))
+
+    (testing "tesser"
+      (is (= (->> (t/map :f) (t/frequencies) (h/tesser a))
+             (->> (t/map :f) (t/frequencies) (h/tesser b)))))))
+
+
 ;; Simple example-based tests
 
 (deftest op-test
@@ -46,7 +191,7 @@
     (is (= "{:process nil,\n :type nil,\n :f nil,\n :value nil,\n :extra 3,\n :index 1,\n :time 2}\n"
            (with-out-str (pprint (h/op {:index 1, :time 2 :extra 3})))))))
 
-(deftest ^:focus index-op-test
+(deftest index-op-test
   (let [a1 (h/op {:type :invoke, :index 0})
         a2 (h/op {:type :ok, :index 0})
         b  (h/op {:type :invoke, :index 1})]
@@ -84,6 +229,8 @@
                       {:f [:complex]}
                       {:f :y}])
         [op0 op1 op2] h]
+    (testing "empty"
+      (check-history-equiv [] (h/filter (constantly false) h)))
     (testing "kw"
       (is (= [op0] (h/filter-f :x h))))
     (testing "compound"
@@ -223,27 +370,6 @@
           (map h/op ops)
           (reductions + skips))))
 
-; Some basic transforms on ops
-(defn read?
-  "Is this a read operation?"
-  [op]
-  (= :r (:f op)))
-
-(defn rewrite-op
-  "Adds a testing field to each operation and wraps the value"
-  [{:keys [process value] :as op}]
-  (assoc op
-         :process (if (integer? process)
-                    (inc process)
-                    process)
-         :value [:rewrite value]))
-
-(defn process-set
-  "A reducing fn for finding the set of all processes in a history."
-  ([] #{})
-  ([ps op]
-   (conj ps (:process op))))
-
 ;; Checking indexing folds
 
 (defn model-dense-pair-index
@@ -325,102 +451,6 @@
               (is (= (model-sparse-history-by-index ops)
                      (f/fold (f/folder (hc/chunked chunk-size ops))
                              h/sparse-history-by-index-fold))))))
-
-(defn check-history-equiv
-  "checks that two histories are equivalent."
-  [a b]
-  ;(prn :a (class a) a)
-  ;(prn :b (class b) b)
-  (testing "count"
-    (is (= (count a) (count b))))
-  (testing "hash"
-    (is (= (hash a) (hash b)))
-    (is (= (.hashCode a) (.hashCode b))))
-  (testing "equality"
-    (is (= a b))
-    (is (= b a))
-    (is (.equals a b))
-    (is (.equals b a)))
-  (testing "string"
-    (is (= (str a) (str b))))
-  (testing "nth/get/fn"
-    (doseq [i (range (count a))]
-      (is (= (nth a i) (nth b i)))
-      (is (= (get a i) (get b i)))
-      (is (= (a i) (b i)))
-      (is (= (nth a i ::missing) (nth b i ::missing)))
-      (is (= (get a i ::missing) (get b i ::missing)))))
-  (testing "destructuring bind"
-    (let [[a1 a2 & as] a
-          [b1 b2 & bs] b]
-      (is (= a1 b1))
-      (is (= a2 b2))
-      (is (= as bs))))
-  (testing "seq"
-    (is (= (seq a) (seq b))))
-  (testing "iterator"
-    (is (= (iterator-seq (.iterator a))
-           (iterator-seq (.iterator b)))))
-
-  ; Reductions
-  (testing "reduce"
-    ; trivial reducer
-    (is (= (into [] a) (into [] b)))
-    ; a set of processes
-    (is (= (reduce process-set #{} a) (reduce process-set #{} b))))
-
-  (testing "coll-fold"
-    (is (= (r/fold set/union process-set a)
-           (r/fold set/union process-set b))))
-
-  ; Changes
-  (testing "empty"
-    (is (= (empty a) (empty b))))
-  (testing "conj"
-    (is (= (conj a ::x) (conj b ::x))))
-  (testing "assoc"
-    (doseq [i (range (count a))]
-      (is (= (assoc a i ::x)
-             (assoc b i ::x)))))
-  (testing "stack"
-    (is (= (peek a) (peek b)))
-    (when-not (empty? a)
-      (is (= (pop a) (pop b)))))
-
-  (when (instance? IHistory a)
-    (testing "pair-index"
-      (doseq [i (map :index a)]
-        (is (= (h/pair-index a i) (h/pair-index b i)))))
-
-    (testing "get-index"
-      (doseq [op a]
-        (let [i (:index op)]
-          (is (= op (h/get-index a i)))
-          (is (= op (h/get-index b i))))))
-
-    (testing "invocation & completion"
-      (doseq [op a]
-        (if (or (h/invoke? op) (not (h/client-op? op)))
-          (is (= (h/completion a op)
-                 (h/completion b op)))
-          (is (= (h/invocation a op)
-                 (h/invocation b op))))))
-
-    (testing "fold"
-      (testing "reduce equivalence"
-        (let [into-vec {:reducer-identity (constantly [])
-                        :reducer conj}]
-          (is (= (vec a)
-                 (h/fold a into-vec)
-                 (h/fold b into-vec)))))
-
-      (testing "complex"
-        (is (= (h/fold a h/pair-index-fold)
-               (h/fold b h/pair-index-fold)))))
-
-    (testing "tesser"
-      (is (= (->> (t/map :f) (t/frequencies) (h/tesser a))
-             (->> (t/map :f) (t/frequencies) (h/tesser b)))))))
 
 (defn check-invoke-complete
   "Takes a history, an invocation, and a completion and validates that they're
@@ -587,7 +617,10 @@
     :oks            [(vec (filter h/ok? model))
                      (h/oks history)]
     :reads          [(vec (filter read? model))
-                     (h/filter (comp #{:r} :f) history)]))
+                     (h/filter read? history)]
+    ;:writes         [(vec (filter write? model))
+    ;                 (h/filter write? history)])
+    ))
 
 (deftest transform-history-test
   ; Generates a series of basic ops, then a series of transformations on top of
@@ -602,7 +635,9 @@
                                          :rewrite-op
                                          :clients
                                          :oks
-                                         :reads])
+                                         :reads
+                                         ;:writes
+                                         ])
                           transform-count)]
             (let [[model history] (reduce transform-history [ops ops]
                                           (cons init-transform transforms))]

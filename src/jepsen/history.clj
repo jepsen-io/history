@@ -957,7 +957,10 @@
 
   clojure.lang.Indexed
   (nth [this i not-found]
-    (map-fn (nth history i not-found)))
+       (let [op (nth history i ::not-found)]
+         (if (identical? op ::not-found)
+           not-found
+           (map-fn op))))
 
   clojure.lang.Reversible
   (rseq [this]
@@ -1113,9 +1116,9 @@
   clojure.lang.Indexed
   (nth [this i not-found]
        (let [^ints a @indices]
-         (when-not (< -1 i (alength a))
-           (throw (IndexOutOfBoundsException. (str "Index " i " out of bounds"))))
-         (.get-index this (aget a i))))
+         (if (or (< i 0) (<= (alength a) i))
+           not-found
+           (.get-index this (aget a i)))))
 
   Iterable
   (forEach [this consumer]

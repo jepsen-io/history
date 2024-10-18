@@ -25,7 +25,7 @@
 
 ;; Simple example-based tests
 
-(deftest ^:focus basic-test
+(deftest basic-test
   (let [dogs [{:legs 6, :name :noodle},
               {:legs 4, :name :stop-it},
               {:legs 4, :name :brown-one-by-the-fish-shop}]

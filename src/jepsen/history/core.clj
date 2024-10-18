@@ -42,7 +42,11 @@
 
   clojure.lang.Indexed
   (nth [this i]
-       (.nth this i nil))
+       ; Note that the form with a not-found argument does not perform bounds
+       ; checking! Yup, this is how Clojure vectors work!
+       (if (and (<= 0 i) (< i (.count this)))
+         (.nth this i nil)
+         (throw (IndexOutOfBoundsException.))))
 
   clojure.lang.IPersistentCollection
   (cons [this x]
