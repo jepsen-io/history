@@ -8,7 +8,7 @@
                  ; Control flow, including fast single-threaded reductions
                  [dom-top "1.0.9"]
                  ; Fast reductions
-                 [tesser.core "1.0.6"]
+                 [tesser.core "1.0.7"]
                  ; Defining datatypes
                  [potemkin "0.4.7"]
                  ; Fast data structures
@@ -19,7 +19,7 @@
                    [[com.gfredericks/test.chuck "0.2.14"]
                     [org.clojure/clojure "1.12.0"]
                     [org.clojure/test.check "1.1.1"]
-                    [org.slf4j/slf4j-simple "2.0.16"]
+                    [org.slf4j/slf4j-simple "2.0.17"]
                     [cheshire "5.13.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &
