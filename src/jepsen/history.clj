@@ -14,7 +14,7 @@
 
   Create operations with the `op` function. Unlike most defrecords, we
   pretty-print these as if they were maps--we print a LOT of them.
-
+  ```
     (require '[jepsen.history :as h])
     (def o (h/op {:process 0, :type :invoke, :f :read, :value [:x nil],
                   :index 0, :time 0}))
@@ -25,108 +25,108 @@
     ;  :value [:x nil],
     ;  :index 0,
     ;  :time 0}
-
+  ```
   We provide a few common functions for interacting with operations:
-
+  ```
     (invoke? o)    ; true
     (client-op? o) ; true
     (info? o)      ; false
-
+  ```
   And of course you can use fast field accessors here too:
-
+  ```
     (.process o) ; 0
-
+  ```
   ## Histories
 
   Given a collection of operations, create a history like so:
-
+  ```
     (def h (h/history [{:process 0, :type :invoke, :f :read}
                        {:process 0, :type :ok, :f :read, :value 5}]))
-
+  ```
   `history` automatically lifts maps into Ops if they aren't already, and adds
   indices (sequential) and times (-1) if you omit them. There are options to
   control how indices are added; see `history` for details.
-
+  ```
     (pprint h)
     ; [{:process 0, :type :invoke, :f :read, :value nil, :index 0, :time -1}
     ;  {:process 0, :type :ok, :f :read, :value 5, :index 1, :time -1}]
-
+  ```
   If you need to convert these back to plain-old maps for writing tests, use
   `as-maps`.
-
+  ```
     (h/as-maps h)
     ; [{:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
     ;  {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}]
-
+  ```
   Histories work almost exactly like vectors (though you can't assoc or conj
   into them).
-
+  ```
     (count h)
     ; 2
     (nth h 1)
     ; {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}
     (map :type h)
     ; [:invoke :ok]
-
+  ```
   But they have a few extra powers. You can get the Op with a particular :index
   regardless of where it is in the collection.
-
+  ```
     (h/get-index h 0)
     ; {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
-
+  ```
   And you can find the corresponding invocation for a completion, and
   vice-versa:
-
+  ```
     (h/invocation h {:index 1, :time -1, :type :ok, :process 0, :f :read,
                      :value 5})
     ; {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil}
 
     (h/completion h {:index 0, :time -1, :type :invoke, :process 0, :f :read, :value nil})
     ; {:index 1, :time -1, :type :ok, :process 0, :f :read, :value 5}
-
+  ```
   We call histories where the :index fields are 0, 1, 2, ... 'dense', and other
   histories 'sparse'. With dense histories, `get-index` is just `nth`. Sparse
   histories are common when you're restricting yourself to just a subset of the
   history, like operations on clients. If you pass sparse indices to `(history
   ops)`, then ask for an op by index, it'll do a one-time fold over the ops to
   find their indices, then cache a lookup table to make future lookups fast.
-
+  ```
     (def h (history [{:index 3, :process 0, :type :invoke, :f :cas,
                       :value [7 8]}]))
     (h/dense-indices? h)
     ; false
     (get-index h 3)
     ; {:index 3, :time -1, :type :invoke, :process 0, :f :cas, :value [7 8]}
-
+  ```
   Let's get a slightly more involved history. This one has a concurrent nemesis
   crashing while process 0 writes 3.
-
+  ```
     (def h (h/history
              [{:process 0, :type :invoke, :f :write, :value 3}
               {:process :nemesis, :type :info, :f :crash}
               {:process 0, :type :ok, :f :write, :value 3}
               {:process :nemesis, :type :info, :f :crash}]))
-
+  ```
   Of course we can filter this to just client operations using regular seq
   operations...
-
+  ```
     (filter h/client-op? h)
     ; [{:process 0, :type :invoke, :f :write, :value 3, :index 0, :time -1}
     ;  {:process 0, :type :ok, :f :write, :value 3, :index 2, :time -1}]
-
+  ```
   But `jepsen.history` also exposes a more efficient version:
-
+  ```
     (h/filter h/client-op? h)
     ; [{:index 0, :time -1, :type :invoke, :process 0, :f :write, :value 3}
     ;  {:index 2, :time -1, :type :ok, :process 0, :f :write, :value 3}]
-
+  ```
   There are also shortcuts for common filtering ops: `client-ops`, `invokes`,
   `oks`, `infos`, and so on.
-
+  ```
     (def ch (h/client-ops h))
     (type ch)
     ; jepsen.history.FilteredHistory
-
+  ```
   Creating a filtered history is O(1), and acts as a lazy view on top of the
   underlying history. Like `clojure.core/filter`, it materializes elements as
   needed. Unlike Clojure's `filter`, it does not (for most ops) cache results
@@ -138,7 +138,7 @@
   invocations and completions, a FilteredHistory computes a small, reduced data
   structure on the fly, and caches it to make later operations of the same type
   fast.
-
+  ```
     (count ch) ; Folds over entire history to count how many match the predicate
     ; 2
     (count ch) ; Cached
@@ -148,7 +148,7 @@
 
     ; (h/get-index ch 2) ; No fold required; underlying history does get-index
     {:index 2, :time -1, :type :ok, :process 0, :f :write, :value 3}
-
+  ```
   Similarly, `h/map` constructs an O(1) lazy view over another history. These
   compose just like normal Clojure `map`/`filter`, and all share structure with
   the underlying history.
@@ -181,29 +181,29 @@
   which means multiple checkers can launch tasks on it without launching a
   bazillion threads. For instance, we might need to know if a history includes
   crashes:
-
+  ```
     (def first-crash (h/task h find-first-crash []
       (->> h (h/filter (comp #{:crash} :f)) first)))
-
+  ```
   Like futures, deref'ing a task yields its result, or throws.
-
+  ```
     @first-crash
     {:index 1, :time -1, :type :info, :process :nemesis, :f :crash,
      :value nil}
-
+  ```
   Unlike futures, tasks can express *dependencies* on other tasks:
-
+  ```
     (def ops-before-crash (h/task h writes [fc first-crash]
       (let [i (:index first-crash)]
         (into [] (take-while #(< (:index %) i)) h))))
-
+  ```
   This task won't run until first-crash has completed, and receives the result
   of the first-crash task as its argument.
-
+  ```
     @ops-before-crash
     ; [{:index 0, :time -1, :type :invoke, :process 0, :f :write, :value 3}]
-
-  See `jepsen.history.task` for more details."
+  ```
+  See [[jepsen.history.task]] for more details."
   (:refer-clojure :exclude [map filter remove])
   (:require [clojure [core :as c]
                      [pprint :as pprint :refer [pprint
@@ -1252,9 +1252,9 @@
 (defmacro task
   "A helper macro for launching new tasks. Takes a history, a symbol for your
   task name, optional data, a binding vector of names to dependency tasks you'd
-  like to depend on, and a single-arity argument vector, and a body. Wraps body
+  like to depend on, and a body. Wraps body
   in a function and submits it to the task executor.
-
+  ```
     (task history find-anomalies []
        ... go do stuff)
 
@@ -1262,7 +1262,8 @@
       ... do stuff with as)
 
     (task history data-task {:custom :data} [as anomalies, f furthermore]
-      ... do stuff with as and f)"
+      ... do stuff with as and f)
+   ```"
   [history task-name & args]
   (let [{:keys [dep-names deps data body]} (parse-task-args args)]
     `(task-call ~history '~task-name ~data [~@deps]
