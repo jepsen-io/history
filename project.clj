@@ -8,7 +8,7 @@
                  ; Control flow, including fast single-threaded reductions
                  [dom-top "1.0.9"]
                  ; Fast reductions
-                 [tesser.core "1.0.7"]
+                 [tesser.core "1.0.8-SNAPSHOT"]
                  ; Defining datatypes
                  [potemkin "0.4.8"]
                  ; Fast data structures
