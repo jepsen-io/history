@@ -10,17 +10,17 @@
                  ; Fast reductions
                  [tesser.core "1.0.7"]
                  ; Defining datatypes
-                 [potemkin "0.4.7"]
+                 [potemkin "0.4.8"]
                  ; Fast data structures
                  [io.lacuna/bifurcan "0.2.0-alpha7"]
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
-                   [[com.gfredericks/test.chuck "0.2.14"]
-                    [org.clojure/clojure "1.12.0"]
+                   [[com.gfredericks/test.chuck "0.2.15"]
+                    [org.clojure/clojure "1.12.3"]
                     [org.clojure/test.check "1.1.1"]
                     [org.slf4j/slf4j-simple "2.0.17"]
-                    [cheshire "5.13.0"]
+                    [cheshire "6.1.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &
   ; defrecords.
