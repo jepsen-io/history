@@ -1,4 +1,4 @@
-(defproject io.jepsen/history "0.1.6-SNAPSHOT"
+(defproject io.jepsen/history "0.1.6"
   :description "A library for working with Jepsen's histories of concurrent systems."
   :url "https://github.com/jepsen-io/history"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
@@ -8,7 +8,7 @@
                  ; Control flow, including fast single-threaded reductions
                  [dom-top "1.0.9"]
                  ; Fast reductions
-                 [tesser.core "1.0.8-SNAPSHOT"]
+                 [tesser.core "1.0.8"]
                  ; Defining datatypes
                  [potemkin "0.4.8"]
                  ; Fast data structures
