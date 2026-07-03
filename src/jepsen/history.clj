@@ -842,6 +842,16 @@
                (when-not (= i -1)
                  (nth ops i))))
 
+  ; Our pair index also relies on by-index
+  (ensure-pair-index [this]
+                     (when-let [o ^Op (first this)];
+                       ; Fire these off concurrently; they can take advantage
+                       ; of a single pass.
+                       (let [pair-index-fut (future @pair-index)]
+                         @by-index
+                         @pair-index-fut))
+                     this)
+
   (pair-index [this index]
               (.get ^IntMap @pair-index index (Integer. -1)))
 

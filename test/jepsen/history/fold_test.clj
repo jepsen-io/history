@@ -11,6 +11,7 @@
                                 [rose-tree :as rose]]
             [clojure.tools.logging :refer [info warn]]
             [dom-top.core :refer [assert+ letr loopr real-pmap]]
+            [jepsen.history :as h]
             [jepsen.history [core :as hc]
                             [fold :as f]
                             [task :as t]
@@ -126,6 +127,23 @@
                   (tesser/into #{})
                   (f/tesser f)))))
     ))
+
+(deftest sparse-history-deadlock-test
+  ; A deadlock that happened with folds over sparsely indexed histories; using
+  ; the pair index also relied on the sparse index index, but it wasn't
+  ; initialized by ensure-pair-index.
+  (let [history (h/history
+                  [{:index 0, :time 0, :type :invoke, :process 0, :f :hi}
+                   {:index 4, :time 4, :type :ok, :process 0, :f :hi}])]
+    (h/ensure-pair-index history)
+    ; A fold that needs to use the pair index
+    (->> (tesser/filter h/invoke?)
+         (tesser/map (partial h/completion history))
+         (tesser/map :index)
+         (tesser/into [])
+         (h/tesser history)
+         (= [4])
+         (is)))) ; when nine hundred years old you reach, test like this, you will
 
 ;; Generative tests
 
