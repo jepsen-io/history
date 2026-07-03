@@ -6,7 +6,7 @@
   :dependencies [; Logging
                  [org.clojure/tools.logging "1.3.1"]
                  ; Control flow, including fast single-threaded reductions
-                 [dom-top "1.0.9"]
+                 [dom-top "1.0.10"]
                  ; Fast reductions
                  [tesser.core "1.0.8"]
                  ; Defining datatypes
@@ -17,10 +17,10 @@
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.15"]
-                    [org.clojure/clojure "1.12.4"]
+                    [org.clojure/clojure "1.12.5"]
                     [org.clojure/test.check "1.1.3"]
-                    [org.slf4j/slf4j-simple "2.0.17"]
-                    [cheshire "6.1.0"]
+                    [org.slf4j/slf4j-simple "2.0.18"]
+                    [cheshire "6.2.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &
   ; defrecords.
