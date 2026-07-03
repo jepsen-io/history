@@ -12,7 +12,7 @@
                  ; Defining datatypes
                  [potemkin "0.4.9"]
                  ; Fast data structures
-                 [io.lacuna/bifurcan "0.2.0-alpha7"]
+                 [com.aphyr/bifurcan-clj "0.1.3"]
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
