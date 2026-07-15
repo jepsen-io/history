@@ -844,7 +844,7 @@
 
   ; Our pair index also relies on by-index
   (ensure-pair-index [this]
-                     (when-let [o ^Op (first this)];
+                     (when-let [o ^Op (first this)]
                        ; Fire these off concurrently; they can take advantage
                        ; of a single pass.
                        (let [pair-index-fut (future @pair-index)]
