@@ -6,13 +6,13 @@
   :dependencies [; Logging
                  [org.clojure/tools.logging "1.3.1"]
                  ; Control flow, including fast single-threaded reductions
-                 [dom-top "1.0.10"]
+                 [dom-top "1.0.11"]
                  ; Fast reductions
-                 [tesser.core "1.0.8"]
+                 [com.aphyr/tesser.core "1.0.10"]
                  ; Defining datatypes
                  [potemkin "0.4.9"]
                  ; Fast data structures
-                 [com.aphyr/bifurcan-clj "0.1.3"]
+                 [com.aphyr/bifurcan-clj "0.1.4"]
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
