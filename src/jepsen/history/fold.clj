@@ -179,7 +179,7 @@
             [dom-top.core :as dt :refer [assert+ loopr]]
             [jepsen.history [core :as hc]
                             [task :as task]]
-            [slingshot.slingshot :refer [try+ throw+]]
+            [clj-commons.slingshot :refer [try+ throw+]]
             [tesser [core :as tesser]
                     [utils :refer [maybe-unary]]])
   (:import (clojure.lang IReduce

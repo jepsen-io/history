@@ -219,7 +219,7 @@
             [potemkin :refer [def-abstract-type
                               definterface+
                               deftype+]]
-            [slingshot.slingshot :refer [try+ throw+]]
+            [clj-commons.slingshot :refer [try+ throw+]]
             [tesser [core :as tesser]
                     [utils :as tesser.utils]])
   (:import (clojure.core.reducers CollFold)

@@ -14,7 +14,7 @@
                  ; Fast data structures
                  [com.aphyr/bifurcan-clj "0.1.6"]
                  ; Errors
-                 [slingshot "0.12.2"]]
+                 [org.clj-commons/slingshot "0.13.0"]]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.15"]
                     [org.clojure/clojure "1.12.6"]
