@@ -12,14 +12,14 @@
                  ; Defining datatypes
                  [potemkin "0.4.9"]
                  ; Fast data structures
-                 [com.aphyr/bifurcan-clj "0.1.4"]
+                 [com.aphyr/bifurcan-clj "0.1.5"]
                  ; Errors
                  [slingshot "0.12.2"]]
   :profiles {:dev {:dependencies
                    [[com.gfredericks/test.chuck "0.2.15"]
-                    [org.clojure/clojure "1.12.5"]
+                    [org.clojure/clojure "1.12.6"]
                     [org.clojure/test.check "1.1.3"]
-                    [org.slf4j/slf4j-simple "2.0.18"]
+                    [org.slf4j/slf4j-simple "2.0.20"]
                     [cheshire "6.2.0"]
                     ]}}
   ; We need to write some Java code later that depends on these interfaces &
